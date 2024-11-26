@@ -1,0 +1,18 @@
+[Unit]
+Description=RPi Camera MJPEG Server
+After=network.target
+
+[Service]
+Type=simple
+Restart=always
+StartLimitInterval=0
+StartLimitBurst=1440
+RestartSec=60
+ExecStart=/usr/bin/python3 /home/pi/mjpeg_server_2.py
+WorkingDirectory=/home/pi
+User=pi
+Group=pi
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
