@@ -25,7 +25,6 @@ import asyncio
 import io
 import logging
 import socketserver
-from functools import partial
 from http import server
 from threading import Condition
 
@@ -78,10 +77,7 @@ class StreamingOutput(io.BufferedIOBase):
 class StreamingHandler(server.BaseHTTPRequestHandler):
     """A request handler for serving the MJPEG stream."""
 
-    def __init__(self, request, client_address, server, frame_buffer) -> None:
-        """Initialize the request handler with the frame buffer."""
-        super().__init__(request, client_address, server)
-        self.frame_buffer = frame_buffer
+    frame_buffer = None
 
     def do_GET(self):  # noqa:N802
         """Serve the MJPEG stream."""
@@ -113,10 +109,7 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 class HttpHandler(server.BaseHTTPRequestHandler):
     """A request handler for serving the HTML page and current frame as a JPEG image."""
 
-    def __init__(self, request, client_address, server, frame_buffer) -> None:
-        """Initialize the request handler with the frame buffer."""
-        super().__init__(request, client_address, server)
-        self.frame_buffer = frame_buffer
+    frame_buffer = None
 
     def do_GET(self):  # noqa:N802
         """Serve the HTML page or the current frame as a JPEG image."""
@@ -173,8 +166,8 @@ def start():
     picam2 = Picamera2()
     picam2.configure(picam2.create_video_configuration(main={"size": (1920, 1080)}))
     output = StreamingOutput()
-    http_handler = partial(HttpHandler, frame_buffer=output)
-    streaming_handler = partial(StreamingHandler, frame_buffer=output)
+    HttpHandler.frame_buffer = output
+    StreamingHandler.frame_buffer = output
     picam2.start_recording(MJPEGEncoder(), FileOutput(output))
     picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
 
@@ -187,7 +180,7 @@ def start():
                 await asyncio.get_event_loop().run_in_executor(None, server.serve_forever)
 
         loop = asyncio.get_event_loop()
-        tasks = [start_server(http_handler, 80), start_server(streaming_handler, 8081)]
+        tasks = [start_server(HttpHandler, 80), start_server(StreamingHandler, 8081)]
         loop.run_until_complete(asyncio.gather(*tasks))
     finally:
         picam2.stop_recording()

@@ -47,9 +47,9 @@ def install():
     # Start the service
     subprocess.run(['sudo', 'systemctl', 'start', 'rpi-camera'])
 
-    executable_file = os.path.join(sys.prefix, '/bin/rpi-camera')
+    executable_file = os.path.join(sys.prefix, 'bin/rpi-camera')
 
     # Make the rpi-camera command available outside the venv
-    subprocess.run(['sudo', 'ln', '-s', executable_file, '/usr/local/bin/rpi-camera'])
+    subprocess.run(['sudo', 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'])
 
     print('The RPi Camera has been installed as a systemd service.')
