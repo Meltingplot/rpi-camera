@@ -29,7 +29,7 @@ To install the required dependencies, run:
     python3 -m venv --system-site-packages venv
     source venv/bin/activate
     pip install meltingplot.rpi_camera
-    sudo rpi-camera install
+    rpi-camera install
 
 Usage
 -----
