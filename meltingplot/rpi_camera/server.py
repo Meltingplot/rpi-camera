@@ -130,7 +130,7 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', len(content))
             self.end_headers()
             self.wfile.write(content)
-        elif url.path == '/picture/1/current/':
+        elif url.path == '/picture/1/current/' or url.path == '/snapshot':
             self.send_response(200)
             self.send_header('Age', 0)
             self.send_header('Cache-Control', 'no-cache, private')

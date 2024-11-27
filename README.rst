@@ -46,6 +46,10 @@ or as a service:
 
     sudo systemctl start rpi-camera
 
+You can view the camera feed by opening `http://<ip_address>` in your web browser.
+To access the live stream, go to `http://<ip_address>:8081/`.
+To capture a snapshot, visit `http://<ip_address>/snapshot` or `http://<ip_address>/picture/1/current/`.
+
 Contributing
 ------------
 
