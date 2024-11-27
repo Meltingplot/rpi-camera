@@ -3,6 +3,12 @@
 """
 This script sets up an HTTP server to stream video from a Raspberry Pi camera using the Picamera2 library.
 
+It is based on the official Picamera2 example for streaming video from a Raspberry Pi camera using the MJPEG format.
+
+https://github.com/raspberrypi/picamera2/blob/main/examples/mjpeg_server_2.py
+
+Which is licensed under the BSD 2-Clause License (https://github.com/raspberrypi/picamera2/blob/main/LICENSE)
+
 It provides both a web interface for viewing the stream and an endpoint for fetching the current frame as a JPEG image.
 Classes:
     StreamingOutput: A class that buffers the video frames and notifies waiting threads when a new frame is available.
@@ -27,6 +33,7 @@ import logging
 import socketserver
 from http import server
 from threading import Condition
+from urllib.parse import urlparse
 
 import click
 
@@ -81,7 +88,8 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa:N802
         """Serve the MJPEG stream."""
-        if self.path == '/' or self.path == '/webcam':
+        url = urlparse(self.path)
+        if url.path == '/' or url.path == '/webcam':
             self.send_response(200)
             self.send_header('Age', 0)
             self.send_header('Cache-Control', 'no-cache, private')
@@ -113,14 +121,16 @@ class HttpHandler(server.BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa:N802
         """Serve the HTML page or the current frame as a JPEG image."""
-        if self.path == '/' or self.path == '/index.html':
+        url = urlparse(self.path)
+
+        if url.path == '/' or url.path == '/index.html':
             content = PAGE.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
             self.send_header('Content-Length', len(content))
             self.end_headers()
             self.wfile.write(content)
-        elif self.path == '/picture/1/current/':
+        elif url.path == '/picture/1/current/':
             self.send_response(200)
             self.send_header('Age', 0)
             self.send_header('Cache-Control', 'no-cache, private')
@@ -163,12 +173,13 @@ def start():
     Raise:
         Exception: If there is an error during the server execution or camera operation.
     """
+    frame_buffer = StreamingOutput()
+    HttpHandler.frame_buffer = frame_buffer
+    StreamingHandler.frame_buffer = frame_buffer
+
     picam2 = Picamera2()
     picam2.configure(picam2.create_video_configuration(main={"size": (1920, 1080)}))
-    output = StreamingOutput()
-    HttpHandler.frame_buffer = output
-    StreamingHandler.frame_buffer = output
-    picam2.start_recording(MJPEGEncoder(), FileOutput(output))
+    picam2.start_recording(MJPEGEncoder(), FileOutput(frame_buffer))
     picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
 
     try:
