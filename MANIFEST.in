@@ -1,0 +1,6 @@
+include versioneer.py
+include meltingplot/rpi-camera/_version.py
+include README.rst
+include LICENSE
+include requirements.txt
+include requirements_test.txt
