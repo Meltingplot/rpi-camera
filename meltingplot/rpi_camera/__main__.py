@@ -1,7 +1,7 @@
 """Define the main entry point for the package."""
 import click
 
-from .cli import install
+from .cli.install import install
 from .server import start
 
 
