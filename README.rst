@@ -1,10 +1,10 @@
-MeltingPlot RPi Camera
+Meltingplot RPi Camera
 ======================
 
 Overview
 --------
 
-MeltingPlot RPi Camera is a Python project designed to interface with a Raspberry Pi camera module.
+Meltingplot RPi Camera is a Python project designed to interface with a Raspberry Pi camera module.
 It captures images and videos, processes them, and provides various functionalities for image analysis
 and manipulation.
 
@@ -63,4 +63,4 @@ This project is licensed under the Apache 2.0 License. See the LICENSE file for 
 Contact
 -------
 
-For any questions or inquiries, please contact Tim at tim@meltingplot.net
+For any questions or inquiries, please contact Tim at info@meltingplot.net
