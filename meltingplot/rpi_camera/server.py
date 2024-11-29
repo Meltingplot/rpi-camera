@@ -76,6 +76,8 @@ class StreamingOutput(io.BufferedIOBase):
         self.frame = None
         self.condition = Condition()
 
+        # Set the orientation of the JPEG image based on the rotation value
+        # more info: http://sylvana.net/jpegcrop/exif_orientation.html
         if rotation == 0:
             orientation = 1
         elif rotation == 90:
