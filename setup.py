@@ -50,6 +50,7 @@ setup(
     data_files=[
         ('', [
             'rpi-camera.service',
+            'reboot_on_wifi_disconnect.sh',
             ]),
     ],
 )

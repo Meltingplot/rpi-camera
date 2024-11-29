@@ -43,6 +43,8 @@ from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
 from picamera2.outputs import FileOutput
 
+import piexif
+
 
 PAGE = """\
 <html>
@@ -69,15 +71,34 @@ PAGE = """\
 class StreamingOutput(io.BufferedIOBase):
     """A class that buffers the video frames and notifies waiting threads when a new frame is available."""
 
-    def __init__(self):
+    def __init__(self, rotation: int = 0):
         """Initialize the streaming output with a frame buffer and condition."""
         self.frame = None
         self.condition = Condition()
 
+        if rotation == 0:
+            orientation = 1
+        elif rotation == 90:
+            orientation = 6
+        elif rotation == 180:
+            orientation = 3
+        elif rotation == 270:
+            orientation = 8
+        else:
+            raise ValueError("Invalid rotation value")
+
+        exif_data = piexif.dump({
+            "0th": {
+                piexif.ImageIFD.Orientation: orientation,
+            },
+        }, )
+        jpeg_app_len = len(exif_data) + 2
+        self.jpeg_app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
+
     def write(self, buf):
         """Write the buffer to the stream and notify waiting threads."""
         with self.condition:
-            self.frame = buf
+            self.frame = buf[:2] + self.jpeg_app1 + buf[2:]
             self.condition.notify_all()
 
 
@@ -173,7 +194,7 @@ def start():
     Raise:
         Exception: If there is an error during the server execution or camera operation.
     """
-    frame_buffer = StreamingOutput()
+    frame_buffer = StreamingOutput(rotation=180)
     HttpHandler.frame_buffer = frame_buffer
     StreamingHandler.frame_buffer = frame_buffer
 
