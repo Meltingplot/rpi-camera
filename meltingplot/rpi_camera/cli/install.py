@@ -59,7 +59,7 @@ def install():
     wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
     subprocess.run(['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
     subprocess.run(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
-    subprocess.check_output(['sudo', '/usr/local/bin/reboot_on_wifi_disconnect.sh install'])
+    subprocess.check_output(['sudo', '/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install'])
 
     # Reload the systemd daemon
     subprocess.run(['sudo', 'systemctl', 'daemon-reload'])
