@@ -60,8 +60,6 @@ def install():
     subprocess.run(['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
     subprocess.run(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
     subprocess.check_output(['sudo', '/usr/local/bin/reboot_on_wifi_disconnect.sh install'])
-    subprocess.run(['sudo', 'systemctl', 'enable', 'reboot_on_wifi_disconnect.service'])
-    subprocess.run(['sudo', 'systemctl', 'start', 'reboot_on_wifi_disconnect.service'])
 
     # Reload the systemd daemon
     subprocess.run(['sudo', 'systemctl', 'daemon-reload'])
