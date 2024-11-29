@@ -46,14 +46,14 @@ def install():
     click.echo('Configuring static IP for wlan0 using nmcli to 10.42.0.3')
 
     # Set the static IP for wlan0 using nmcli
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.addresses', '10.42.0.3/24'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.gateway', '10.42.0.1'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.dns', '10.42.0.1'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.method', 'manual'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.addresses', '10.42.0.3/24'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.gateway', '10.42.0.1'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.dns', '10.42.0.1'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.method', 'manual'])
 
     # Bring the connection down and up to apply changes
-    subprocess.run(['sudo', 'nmcli', 'con', 'down', 'wlan0'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'up', 'wlan0'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'down', 'preconfigured'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'up', 'preconfigured'])
 
     click.echo('Install reboot on wifi disconnect service')
     wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
