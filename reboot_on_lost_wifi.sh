@@ -16,9 +16,10 @@ install_service() {
     cat <<EOF | sudo tee /etc/systemd/system/reboot_on_lost_wifi.service
 [Unit]
 Description=Reboot on Lost WiFi
-After=network.target
+After=network.target NetworkManager.service
 
 [Service]
+ExecStartPre=/bin/sleep 60
 ExecStart=/usr/local/bin/reboot_on_lost_wifi.sh
 Restart=always
 User=root

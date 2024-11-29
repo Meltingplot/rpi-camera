@@ -38,25 +38,38 @@ def install():
         # Copy the service file to /etc/systemd/system
         subprocess.check_output(['sudo', 'cp', tmp_file.name, '/etc/systemd/system/rpi-camera.service'])
 
-    # Reload the systemd daemon
-    subprocess.run(['sudo', 'systemctl', 'daemon-reload'])
+    executable_file = os.path.join(sys.exec_prefix, 'bin/rpi-camera')
+
+    # Make the rpi-camera command available outside the venv
+    subprocess.run(['sudo', 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'])
+
+    click.echo('Configuring static IP for wlan0 using nmcli to 10.42.0.3')
+
+    # Set the static IP for wlan0 using nmcli
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.addresses', '10.42.0.3/24'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.gateway', '10.42.0.1'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.dns', '10.42.0.1'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'wlan0', 'ipv4.method', 'manual'])
+
+    # Bring the connection down and up to apply changes
+    subprocess.run(['sudo', 'nmcli', 'con', 'down', 'wlan0'])
+    subprocess.run(['sudo', 'nmcli', 'con', 'up', 'wlan0'])
 
     click.echo('Install reboot on wifi disconnect service')
     wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
     subprocess.run(['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
     subprocess.run(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
+    subprocess.check_output(['sudo', '/usr/local/bin/reboot_on_wifi_disconnect.sh install'])
     subprocess.run(['sudo', 'systemctl', 'enable', 'reboot_on_wifi_disconnect.service'])
     subprocess.run(['sudo', 'systemctl', 'start', 'reboot_on_wifi_disconnect.service'])
+
+    # Reload the systemd daemon
+    subprocess.run(['sudo', 'systemctl', 'daemon-reload'])
 
     # Enable the service
     subprocess.run(['sudo', 'systemctl', 'enable', 'rpi-camera'])
 
     # Start the service
     subprocess.run(['sudo', 'systemctl', 'start', 'rpi-camera'])
-
-    executable_file = os.path.join(sys.exec_prefix, 'bin/rpi-camera')
-
-    # Make the rpi-camera command available outside the venv
-    subprocess.run(['sudo', 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'])
 
     click.echo('The RPi Camera has been installed as a systemd service.')

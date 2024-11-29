@@ -91,7 +91,7 @@ class StreamingOutput(io.BufferedIOBase):
             "0th": {
                 piexif.ImageIFD.Orientation: orientation,
             },
-        }, )
+        })
         jpeg_app_len = len(exif_data) + 2
         self.jpeg_app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
 
