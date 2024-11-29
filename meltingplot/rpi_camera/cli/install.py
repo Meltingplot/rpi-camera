@@ -41,33 +41,33 @@ def install():
     executable_file = os.path.join(sys.exec_prefix, 'bin/rpi-camera')
 
     # Make the rpi-camera command available outside the venv
-    subprocess.run(['sudo', 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'])
+    subprocess.check_output(['sudo', 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'])
 
     click.echo('Configuring static IP for wlan0 using nmcli to 10.42.0.3')
 
     # Set the static IP for wlan0 using nmcli
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.addresses', '10.42.0.3/24'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.gateway', '10.42.0.1'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.dns', '10.42.0.1'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.method', 'manual'])
+    subprocess.check_output(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.addresses', '10.42.0.3/24'])
+    subprocess.check_output(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.gateway', '10.42.0.1'])
+    subprocess.check_output(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.dns', '10.42.0.1'])
+    subprocess.check_output(['sudo', 'nmcli', 'con', 'mod', 'preconfigured', 'ipv4.method', 'manual'])
 
     # Bring the connection down and up to apply changes
-    subprocess.run(['sudo', 'nmcli', 'con', 'down', 'preconfigured'])
-    subprocess.run(['sudo', 'nmcli', 'con', 'up', 'preconfigured'])
+    subprocess.check_output(['sudo', 'nmcli', 'con', 'down', 'preconfigured'])
+    subprocess.check_output(['sudo', 'nmcli', 'con', 'up', 'preconfigured'])
 
     click.echo('Install reboot on wifi disconnect service')
     wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
-    subprocess.run(['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
-    subprocess.run(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
+    subprocess.check_output(['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
+    subprocess.check_output(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'])
     subprocess.check_output(['sudo', '/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install'])
 
     # Reload the systemd daemon
-    subprocess.run(['sudo', 'systemctl', 'daemon-reload'])
+    subprocess.check_output(['sudo', 'systemctl', 'daemon-reload'])
 
     # Enable the service
-    subprocess.run(['sudo', 'systemctl', 'enable', 'rpi-camera'])
+    subprocess.check_output(['sudo', 'systemctl', 'enable', 'rpi-camera'])
 
     # Start the service
-    subprocess.run(['sudo', 'systemctl', 'start', 'rpi-camera'])
+    subprocess.check_output(['sudo', 'systemctl', 'start', 'rpi-camera'])
 
     click.echo('The RPi Camera has been installed as a systemd service.')

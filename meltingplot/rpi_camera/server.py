@@ -198,10 +198,18 @@ def start():
     HttpHandler.frame_buffer = frame_buffer
     StreamingHandler.frame_buffer = frame_buffer
 
-    picam2 = Picamera2()
+    try:
+        picam2 = Picamera2()
+    except IndexError as e:
+        logging.error("Error initializing the camera: %s - is a RPi camera connected?", str(e))
+        raise
+
     picam2.configure(picam2.create_video_configuration(main={"size": (1920, 1080)}))
     picam2.start_recording(MJPEGEncoder(), FileOutput(frame_buffer))
-    picam2.set_controls({"AfMode": controls.AfModeEnum.Continuous})
+    picam2.set_controls({
+        "AfMode": controls.AfModeEnum.Continuous,
+        "FrameRate": 10,
+    })
 
     try:
 

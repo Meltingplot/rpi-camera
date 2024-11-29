@@ -41,15 +41,19 @@ EOF
 
 # Main function to monitor WiFi connection
 monitor_wifi() {
+    failure_count=0
     while true; do
         # Check connection status every second for 5 seconds
-        for i in {1..5}; do
-            if ! check_wlan0_connected || ! check_ip_reachable; then
-                echo "wlan0 is not connected or 10.42.0.1 is not reachable. Rebooting..."
+        if ! check_wlan0_connected || ! check_ip_reachable; then
+            failure_count=$((failure_count + 1))
+            if [ "$failure_count" -ge 3 ]; then
+                echo "wlan0 is not connected or 10.42.0.1 is not reachable for 3 consecutive checks. Rebooting..."
                 reboot
             fi
-            sleep 1
-        done
+        else
+            failure_count=0
+        fi
+        sleep 1
     done
 }
 
