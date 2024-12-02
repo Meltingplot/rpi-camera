@@ -72,7 +72,20 @@ class StreamingOutput(io.BufferedIOBase):
     """A class that buffers the video frames and notifies waiting threads when a new frame is available."""
 
     def __init__(self, rotation: int = 0):
-        """Initialize the streaming output with a frame buffer and condition."""
+        """
+        Initialize the streaming output with a frame buffer and condition.
+
+        Args:
+            rotation (int): The rotation angle for the JPEG image. Must be one of 
+                            [0, 90, 180, 270]. Default is 0.
+
+        Raises:
+            ValueError: If the rotation value is not one of [0, 90, 180, 270].
+
+        Attributes:
+            frame (None): Placeholder for the frame buffer.
+            condition (Condition): Condition variable for thread synchronization.
+        """
         self.frame = None
         self.condition = Condition()
 
@@ -95,12 +108,12 @@ class StreamingOutput(io.BufferedIOBase):
             },
         })
         jpeg_app_len = len(exif_data) + 2
-        self.jpeg_app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
+        self._jpeg_app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
 
     def write(self, buf):
         """Write the buffer to the stream and notify waiting threads."""
         with self.condition:
-            self.frame = buf[:2] + self.jpeg_app1 + buf[2:]
+            self.frame = buf[:2] + self._jpeg_app1 + buf[2:]
             self.condition.notify_all()
 
 
