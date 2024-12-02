@@ -76,7 +76,7 @@ class StreamingOutput(io.BufferedIOBase):
         Initialize the streaming output with a frame buffer and condition.
 
         Args:
-            rotation (int): The rotation angle for the JPEG image. Must be one of 
+            rotation (int): The rotation angle for the JPEG image. Must be one of
                             [0, 90, 180, 270]. Default is 0.
 
         Raises:
