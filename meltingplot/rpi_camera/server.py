@@ -179,7 +179,6 @@ class HttpHandler(server.BaseHTTPRequestHandler):
                 self.send_header('Content-Length', len(frame))
                 self.end_headers()
                 self.wfile.write(frame)
-                self.wfile.write(b'\r\n')
             except Exception as e:
                 logging.warning('Removed client %s: %s', self.client_address, str(e))
         else:
