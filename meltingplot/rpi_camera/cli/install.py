@@ -27,6 +27,11 @@ def install():
     current_group = grp.getgrgid(os.getgid()).gr_name
     service_content = service_content.replace('User=pi', f'User={current_user}', 1)
     service_content = service_content.replace('Group=pi', f'Group={current_group}', 1)
+    service_content = service_content.replace(
+        'WorkingDirectory=/home/pi',
+        f'WorkingDirectory={os.path.expanduser("~")}',
+        1,
+    )
 
     click.echo(f"Installing the service as user/group: {current_user}/{current_group}")
 
