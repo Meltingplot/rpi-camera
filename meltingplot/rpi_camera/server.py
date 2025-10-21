@@ -251,7 +251,7 @@ def start():
         tasks = [
             loop.create_task(start_server(HttpHandler, 80)),
             loop.create_task(start_server(StreamingHandler, 8081)),
-            loop.create_task(watchdog(frame_buffer))
+            loop.create_task(watchdog(frame_buffer)),
         ]
         loop.run_until_complete(asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED))
     finally:
