@@ -248,7 +248,11 @@ def start():
                 await asyncio.get_event_loop().run_in_executor(None, server.serve_forever)
 
         loop = asyncio.get_event_loop()
-        tasks = [start_server(HttpHandler, 80), start_server(StreamingHandler, 8081), watchdog(frame_buffer)]
+        tasks = [
+            loop.create_task(start_server(HttpHandler, 80)),
+            loop.create_task(start_server(StreamingHandler, 8081)),
+            loop.create_task(watchdog(frame_buffer))
+        ]
         loop.run_until_complete(asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED))
     finally:
         picam2.stop_recording()
