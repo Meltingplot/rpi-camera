@@ -30,6 +30,7 @@ Usage:
 import asyncio
 import io
 import logging
+import os
 import socketserver
 from http import server
 from threading import Condition
@@ -88,6 +89,7 @@ class StreamingOutput(io.BufferedIOBase):
         """
         self.frame = None
         self.condition = Condition()
+        self.frame_counter = 0
 
         # Set the orientation of the JPEG image based on the rotation value
         # more info: http://sylvana.net/jpegcrop/exif_orientation.html
@@ -114,6 +116,7 @@ class StreamingOutput(io.BufferedIOBase):
         """Write the buffer to the stream and notify waiting threads."""
         with self.condition:
             self.frame = buf[:2] + self._jpeg_app1 + buf[2:]
+            self.frame_counter += 1
             self.condition.notify_all()
 
 
@@ -193,6 +196,17 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     daemon_threads = True
 
 
+async def watchdog(frame_buffer, interval=2):
+    """Monitor the frame buffer and log a warning if no new frames are received within the interval."""
+    last_count = frame_buffer.frame_counter
+    while True:
+        await asyncio.sleep(interval)
+        if frame_buffer.frame_counter == last_count:
+            logging.warning("No new frames received in the last interval! Rebooting...")
+            os.system("sudo reboot")
+        last_count = frame_buffer.frame_counter
+
+
 @click.command()
 def start():
     """
@@ -234,7 +248,7 @@ def start():
                 await asyncio.get_event_loop().run_in_executor(None, server.serve_forever)
 
         loop = asyncio.get_event_loop()
-        tasks = [start_server(HttpHandler, 80), start_server(StreamingHandler, 8081)]
-        loop.run_until_complete(asyncio.gather(*tasks))
+        tasks = [start_server(HttpHandler, 80), start_server(StreamingHandler, 8081), watchdog(frame_buffer)]
+        loop.run_until_complete(asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED))
     finally:
         picam2.stop_recording()
