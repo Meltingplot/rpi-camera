@@ -30,10 +30,10 @@ Usage:
 import asyncio
 import io
 import logging
-import os
 import socketserver
+import subprocess
 from http import server
-from threading import Condition
+from threading import Condition, Semaphore
 from urllib.parse import urlparse
 
 import click
@@ -113,7 +113,7 @@ class StreamingOutput(io.BufferedIOBase):
 
     @property
     def hw_transform(self):
-        """libcamera Transform applied at sensor readout (free).
+        """Sensor-readout Transform applied for free by libcamera.
 
         180° = hflip + vflip is a sensor-register flip on IMX219/477/708;
         90°/270° fall back to the EXIF tag set in ``__init__``.
@@ -122,7 +122,12 @@ class StreamingOutput(io.BufferedIOBase):
         return Transform(hflip=flip, vflip=flip)
 
     def write(self, buf):
-        """Write the buffer to the stream and notify waiting threads."""
+        """Write the buffer to the stream and notify waiting threads.
+
+        ``self.frame`` is always *replaced* with a fresh immutable bytes object,
+        never mutated in place — readers may therefore keep a local reference
+        after releasing the condition lock.
+        """
         with self.condition:
             if self._jpeg_app1 is None:
                 self.frame = buf
@@ -208,10 +213,36 @@ class HttpHandler(server.BaseHTTPRequestHandler):
 
 
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
-    """This class extends the HTTPServer class to support threading and reuse addresses."""
+    """Threaded HTTPServer with a hard cap on concurrent worker threads.
+
+    Each MJPEG client holds a worker thread for the entire stream duration, so
+    without a cap a slow disconnect / TCP-half-close can pile up threads. New
+    connections beyond ``max_clients`` are refused immediately.
+    """
 
     allow_reuse_address = True
     daemon_threads = True
+    max_clients = 16
+
+    def __init__(self, *args, **kwargs):
+        """Initialize the HTTP server and the concurrent-client semaphore."""
+        super().__init__(*args, **kwargs)
+        self._client_sem = Semaphore(self.max_clients)
+
+    def process_request(self, request, client_address):
+        """Reject the connection if the concurrent-client limit is reached."""
+        if not self._client_sem.acquire(blocking=False):
+            logging.warning('Rejecting %s: max %d clients reached', client_address, self.max_clients)
+            self.shutdown_request(request)
+            return
+        super().process_request(request, client_address)
+
+    def process_request_thread(self, request, client_address):
+        """Run the request and always release the semaphore on exit."""
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._client_sem.release()
 
 
 async def watchdog(frame_buffer, interval=2, grace_period=30):
@@ -226,26 +257,39 @@ async def watchdog(frame_buffer, interval=2, grace_period=30):
         await asyncio.sleep(interval)
         if frame_buffer.frame_counter == last_count:
             logging.warning("No new frames received in the last interval! Rebooting...")
-            os.system("sudo reboot")
+            subprocess.run(["sudo", "reboot"], check=False)
         last_count = frame_buffer.frame_counter
 
 
 @click.command()
-def start():
+@click.option(
+    '--rotation',
+    type=click.Choice(['0', '90', '180', '270']),
+    default='180',
+    show_default=True,
+    help='Image rotation in degrees. 0/180 are applied by the sensor (free); '
+    '90/270 are signalled to the client via EXIF.',
+)
+@click.option('--width', type=int, default=1920, show_default=True, help='Capture width in pixels.')
+@click.option('--height', type=int, default=1080, show_default=True, help='Capture height in pixels.')
+@click.option('--framerate', type=int, default=10, show_default=True, help='Target frame rate.')
+@click.option(
+    '--http-port',
+    type=int,
+    default=80,
+    show_default=True,
+    help='Port for the landing page and snapshot endpoint.',
+)
+@click.option('--stream-port', type=int, default=8081, show_default=True, help='Port for the MJPEG stream.')
+def start(rotation, width, height, framerate, http_port, stream_port):
     """
     Initialize and start the Raspberry Pi camera for video streaming.
 
-    Configure the camera to record video at 1920x1080 resolution,
-    set up the streaming output, and start the HTTP and streaming servers on
-    specified ports (80 and 8081). Set the autofocus mode to continuous.
-
-    Ensure that the camera recording is stopped properly when the
-    servers are no longer running.
-
-    Raise:
-        Exception: If there is an error during the server execution or camera operation.
+    Configures the camera, sets the autofocus mode to continuous, and runs both
+    HTTP servers and the watchdog until any task stops. Ensures recording is
+    stopped on exit so systemd can restart cleanly.
     """
-    frame_buffer = StreamingOutput(rotation=180)
+    frame_buffer = StreamingOutput(rotation=int(rotation))
     HttpHandler.frame_buffer = frame_buffer
     StreamingHandler.frame_buffer = frame_buffer
 
@@ -257,27 +301,27 @@ def start():
 
     picam2.configure(
         picam2.create_video_configuration(
-            main={"size": (1920, 1080)},
+            main={"size": (width, height)},
             transform=frame_buffer.hw_transform,
-        )
+        ),
     )
     picam2.start_recording(MJPEGEncoder(), FileOutput(frame_buffer))
     picam2.set_controls({
         "AfMode": controls.AfModeEnum.Continuous,
-        "FrameRate": 10,
+        "FrameRate": framerate,
     })
 
     try:
-        asyncio.run(_run(frame_buffer))
+        asyncio.run(_run(frame_buffer, http_port, stream_port))
     finally:
         picam2.stop_recording()
 
 
-async def _run(frame_buffer):
+async def _run(frame_buffer, http_port, stream_port):
     """Run both HTTP servers and the watchdog; exit when any of them stops."""
     loop = asyncio.get_running_loop()
-    http = StreamingServer(('', 80), HttpHandler)
-    stream = StreamingServer(('', 8081), StreamingHandler)
+    http = StreamingServer(('', http_port), HttpHandler)
+    stream = StreamingServer(('', stream_port), StreamingHandler)
     servers = (http, stream)
 
     server_futures = [loop.run_in_executor(None, s.serve_forever) for s in servers]
