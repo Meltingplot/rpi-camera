@@ -138,7 +138,11 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             try:
                 while True:
                     with self.frame_buffer.condition:
-                        self.frame_buffer.condition.wait()
+                        if not self.frame_buffer.condition.wait(timeout=5):
+                            # Camera stalled — drop the client so the thread can exit
+                            # rather than blocking forever. Watchdog will reboot if needed.
+                            logging.warning('No frame within timeout, disconnecting %s', self.client_address)
+                            break
                         frame = self.frame_buffer.frame
                     self.wfile.write(b'--FRAME\r\n')
                     self.send_header('Content-Type', 'image/jpeg')
@@ -170,14 +174,16 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(content)
         elif url.path == '/picture/1/current/' or url.path == '/snapshot':
-            self.send_response(200)
-            self.send_header('Age', 0)
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
             try:
                 with self.frame_buffer.condition:
-                    self.frame_buffer.condition.wait()
+                    if not self.frame_buffer.condition.wait(timeout=5):
+                        self.send_error(503, 'Camera frame unavailable')
+                        return
                     frame = self.frame_buffer.frame
+                self.send_response(200)
+                self.send_header('Age', 0)
+                self.send_header('Cache-Control', 'no-cache, private')
+                self.send_header('Pragma', 'no-cache')
                 self.send_header('Content-Type', 'image/jpeg')
                 self.send_header('Content-Length', len(frame))
                 self.end_headers()
@@ -196,8 +202,13 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
     daemon_threads = True
 
 
-async def watchdog(frame_buffer, interval=2):
-    """Monitor the frame buffer and log a warning if no new frames are received within the interval."""
+async def watchdog(frame_buffer, interval=2, grace_period=30):
+    """Monitor the frame buffer and reboot if no new frames are received within the interval.
+
+    The grace_period absorbs camera initialization delay at startup; without it a
+    slow-to-start camera triggers an immediate reboot loop.
+    """
+    await asyncio.sleep(grace_period)
     last_count = frame_buffer.frame_counter
     while True:
         await asyncio.sleep(interval)
