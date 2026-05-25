@@ -38,7 +38,7 @@ from urllib.parse import urlparse
 
 import click
 
-from libcamera import controls
+from libcamera import Transform, controls
 
 from picamera2 import Picamera2
 from picamera2.encoders import MJPEGEncoder
@@ -76,46 +76,57 @@ class StreamingOutput(io.BufferedIOBase):
         """
         Initialize the streaming output with a frame buffer and condition.
 
+        0° and 180° are applied by the sensor (see :attr:`hw_transform`) and
+        therefore need no EXIF tag. 90°/270° cannot be done in the sensor and
+        are offloaded to the client via an EXIF Orientation tag.
+
         Args:
             rotation (int): The rotation angle for the JPEG image. Must be one of
                             [0, 90, 180, 270]. Default is 0.
 
         Raises:
             ValueError: If the rotation value is not one of [0, 90, 180, 270].
-
-        Attributes:
-            frame (None): Placeholder for the frame buffer.
-            condition (Condition): Condition variable for thread synchronization.
         """
+        if rotation not in (0, 90, 180, 270):
+            raise ValueError("Invalid rotation value")
+
         self.frame = None
         self.condition = Condition()
         self.frame_counter = 0
+        self.rotation = rotation
 
-        # Set the orientation of the JPEG image based on the rotation value
-        # more info: http://sylvana.net/jpegcrop/exif_orientation.html
-        if rotation == 0:
-            orientation = 1
-        elif rotation == 90:
-            orientation = 6
-        elif rotation == 180:
-            orientation = 3
-        elif rotation == 270:
-            orientation = 8
+        # EXIF Orientation tag — only needed for rotations the sensor can't do.
+        # See http://sylvana.net/jpegcrop/exif_orientation.html
+        orientation = {90: 6, 270: 8}.get(rotation)
+        if orientation is None:
+            self._jpeg_app1 = None
         else:
-            raise ValueError("Invalid rotation value")
+            exif_data = piexif.dump({
+                "0th": {
+                    piexif.ImageIFD.Orientation: orientation,
+                },
+            })
+            jpeg_app_len = len(exif_data) + 2
+            self._jpeg_app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
 
-        exif_data = piexif.dump({
-            "0th": {
-                piexif.ImageIFD.Orientation: orientation,
-            },
-        })
-        jpeg_app_len = len(exif_data) + 2
-        self._jpeg_app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
+    @property
+    def hw_transform(self):
+        """libcamera Transform applied at sensor readout (free).
+
+        180° = hflip + vflip is a sensor-register flip on IMX219/477/708;
+        90°/270° fall back to the EXIF tag set in ``__init__``.
+        """
+        flip = self.rotation == 180
+        return Transform(hflip=flip, vflip=flip)
 
     def write(self, buf):
         """Write the buffer to the stream and notify waiting threads."""
         with self.condition:
-            self.frame = buf[:2] + self._jpeg_app1 + buf[2:]
+            if self._jpeg_app1 is None:
+                self.frame = buf
+            else:
+                # One pre-sized allocation instead of two intermediate copies.
+                self.frame = b"".join((buf[:2], self._jpeg_app1, buf[2:]))
             self.frame_counter += 1
             self.condition.notify_all()
 
@@ -243,7 +254,12 @@ def start():
         logging.error("Error initializing the camera: %s - is a RPi camera connected?", str(e))
         raise
 
-    picam2.configure(picam2.create_video_configuration(main={"size": (1920, 1080)}))
+    picam2.configure(
+        picam2.create_video_configuration(
+            main={"size": (1920, 1080)},
+            transform=frame_buffer.hw_transform,
+        )
+    )
     picam2.start_recording(MJPEGEncoder(), FileOutput(frame_buffer))
     picam2.set_controls({
         "AfMode": controls.AfModeEnum.Continuous,
