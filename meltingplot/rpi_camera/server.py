@@ -268,19 +268,29 @@ def start():
     })
 
     try:
-
-        async def start_server(handler, port):
-            address = ('', port)
-            server = StreamingServer(address, handler)
-            with server:
-                await asyncio.get_event_loop().run_in_executor(None, server.serve_forever)
-
-        loop = asyncio.get_event_loop()
-        tasks = [
-            loop.create_task(start_server(HttpHandler, 80)),
-            loop.create_task(start_server(StreamingHandler, 8081)),
-            loop.create_task(watchdog(frame_buffer)),
-        ]
-        loop.run_until_complete(asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED))
+        asyncio.run(_run(frame_buffer))
     finally:
         picam2.stop_recording()
+
+
+async def _run(frame_buffer):
+    """Run both HTTP servers and the watchdog; exit when any of them stops."""
+    loop = asyncio.get_running_loop()
+    http = StreamingServer(('', 80), HttpHandler)
+    stream = StreamingServer(('', 8081), StreamingHandler)
+    servers = (http, stream)
+
+    server_futures = [loop.run_in_executor(None, s.serve_forever) for s in servers]
+    watchdog_task = asyncio.create_task(watchdog(frame_buffer))
+    pending = (*server_futures, watchdog_task)
+
+    try:
+        await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        # shutdown() signals serve_forever (running in the executor) to return,
+        # then server_close() releases the listening sockets.
+        for s in servers:
+            s.shutdown()
+            s.server_close()
+        watchdog_task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)

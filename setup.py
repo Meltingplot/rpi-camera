@@ -38,6 +38,7 @@ setup(
     packages=find_packages(exclude=('tests', 'docs', 'venv')),
     include_package_data=True,
     zip_safe=False,
+    python_requires='>=3.10',
     install_requires=REQUIREMENTS,
     extras_require={
         'test': REQUIREMENTS_TEST,
