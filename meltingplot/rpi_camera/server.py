@@ -68,6 +68,8 @@ PAGE = """\
 </html>
 """  # noqa:E501
 
+PAGE_BYTES = PAGE.encode('utf-8')
+
 
 class StreamingOutput(io.BufferedIOBase):
     """A class that buffers the video frames and notifies waiting threads when a new frame is available."""
@@ -178,12 +180,11 @@ class HttpHandler(server.BaseHTTPRequestHandler):
         url = urlparse(self.path)
 
         if url.path == '/' or url.path == '/index.html':
-            content = PAGE.encode('utf-8')
             self.send_response(200)
             self.send_header('Content-Type', 'text/html')
-            self.send_header('Content-Length', len(content))
+            self.send_header('Content-Length', len(PAGE_BYTES))
             self.end_headers()
-            self.wfile.write(content)
+            self.wfile.write(PAGE_BYTES)
         elif url.path == '/picture/1/current/' or url.path == '/snapshot':
             try:
                 with self.frame_buffer.condition:
