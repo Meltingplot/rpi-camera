@@ -64,6 +64,11 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
     import sys
     import tempfile
 
+    # Drop the `sudo` prefix when already root — image-build chroots typically
+    # run the install as root and don't have an interactive sudo password
+    # available. Skipping sudo there avoids `sudo: a password is required`.
+    sudo = [] if os.geteuid() == 0 else ['sudo']
+
     # Get the path of the service file
     rpi_camera_service_file = os.path.join(sys.prefix, 'rpi-camera.service')
 
@@ -90,12 +95,12 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
         tmp_file.flush()
 
         # Copy the service file to /etc/systemd/system
-        subprocess.run(['sudo', 'cp', tmp_file.name, '/etc/systemd/system/rpi-camera.service'], check=True)
+        subprocess.run([*sudo, 'cp', tmp_file.name, '/etc/systemd/system/rpi-camera.service'], check=True)
 
     executable_file = os.path.join(sys.exec_prefix, 'bin/rpi-camera')
 
     # Make the rpi-camera command available outside the venv
-    subprocess.run(['sudo', 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'], check=True)
+    subprocess.run([*sudo, 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'], check=True)
 
     if not configure_network:
         click.echo(
@@ -122,7 +127,7 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
         # Set address, gateway, DNS and method in a single atomic nmcli call
         subprocess.run(
             [
-                'sudo',
+                *sudo,
                 'nmcli',
                 'con',
                 'mod',
@@ -140,29 +145,36 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
         )
 
         # Bring the connection down and up to apply changes
-        subprocess.run(['sudo', 'nmcli', 'con', 'down', connection], check=True)
-        subprocess.run(['sudo', 'nmcli', 'con', 'up', connection], check=True)
+        subprocess.run([*sudo, 'nmcli', 'con', 'down', connection], check=True)
+        subprocess.run([*sudo, 'nmcli', 'con', 'up', connection], check=True)
 
     if wifi_watchdog:
         click.echo(f'Installing WiFi watchdog for iface={iface}, gateway={gateway}')
         wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
         subprocess.run(
-            ['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'],
+            [*sudo, 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'],
             check=True,
         )
-        subprocess.run(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'], check=True)
-        # `sudo VAR=val cmd` passes the env vars to the script (sudo's env strip
-        # normally hides them); the script bakes them into the systemd unit.
-        subprocess.run(
-            [
-                'sudo',
-                f'WIFI_IFACE={iface}',
-                f'GATEWAY={gateway}',
-                '/usr/local/bin/reboot_on_wifi_disconnect.sh',
-                'install',
-            ],
-            check=True,
-        )
+        subprocess.run([*sudo, 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'], check=True)
+        # When non-root, sudo strips env, so we hand the env vars via the
+        # `VAR=val cmd` form that sudo accepts. When root, plain env= works.
+        if sudo:
+            subprocess.run(
+                [
+                    *sudo,
+                    f'WIFI_IFACE={iface}',
+                    f'GATEWAY={gateway}',
+                    '/usr/local/bin/reboot_on_wifi_disconnect.sh',
+                    'install',
+                ],
+                check=True,
+            )
+        else:
+            subprocess.run(
+                ['/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install'],
+                check=True,
+                env={**os.environ, 'WIFI_IFACE': iface, 'GATEWAY': gateway},
+            )
     else:
         click.echo('Skipping WiFi watchdog install (--no-wifi-watchdog).')
 
@@ -173,15 +185,15 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
     systemd_running = os.path.isdir('/run/systemd/system')
 
     if systemd_running:
-        subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
-        subprocess.run(['sudo', 'systemctl', 'enable', 'rpi-camera'], check=True)
-        subprocess.run(['sudo', 'systemctl', 'start', 'rpi-camera'], check=True)
+        subprocess.run([*sudo, 'systemctl', 'daemon-reload'], check=True)
+        subprocess.run([*sudo, 'systemctl', 'enable', 'rpi-camera'], check=True)
+        subprocess.run([*sudo, 'systemctl', 'start', 'rpi-camera'], check=True)
         click.echo('The RPi Camera has been installed as a systemd service.')
     else:
         wants_dir = '/etc/systemd/system/multi-user.target.wants'
-        subprocess.run(['sudo', 'mkdir', '-p', wants_dir], check=True)
+        subprocess.run([*sudo, 'mkdir', '-p', wants_dir], check=True)
         subprocess.run(
-            ['sudo', 'ln', '-sf', '/etc/systemd/system/rpi-camera.service', f'{wants_dir}/rpi-camera.service'],
+            [*sudo, 'ln', '-sf', '/etc/systemd/system/rpi-camera.service', f'{wants_dir}/rpi-camera.service'],
             check=True,
         )
         click.echo(

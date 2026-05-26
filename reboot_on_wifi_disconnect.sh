@@ -23,7 +23,15 @@ check_ip_reachable() {
 # Embeds the current env values as Environment= lines so the running service
 # uses them — env vars do not survive across `systemctl start` by themselves.
 install_service() {
-    cat <<EOF | sudo tee /etc/systemd/system/reboot_on_wifi_disconnect.service
+    # Drop the sudo prefix when already root (image-build chroots typically
+    # run as root and don't have an interactive sudo password available).
+    if [ "$(id -u)" -eq 0 ]; then
+        SUDO=""
+    else
+        SUDO="sudo"
+    fi
+
+    cat <<EOF | $SUDO tee /etc/systemd/system/reboot_on_wifi_disconnect.service
 [Unit]
 Description=Reboot on Lost WiFi
 After=network.target NetworkManager.service
@@ -46,13 +54,13 @@ EOF
     # In image-build chroots it's absent — skip daemon-reload/start and create
     # the wants/ symlink by hand instead of calling `systemctl enable`.
     if [ -d /run/systemd/system ]; then
-        sudo systemctl daemon-reload
-        sudo systemctl enable reboot_on_wifi_disconnect.service
-        sudo systemctl start reboot_on_wifi_disconnect.service
+        $SUDO systemctl daemon-reload
+        $SUDO systemctl enable reboot_on_wifi_disconnect.service
+        $SUDO systemctl start reboot_on_wifi_disconnect.service
     else
         echo "systemd not running (image build?) — creating wants/ symlink manually."
-        sudo mkdir -p /etc/systemd/system/multi-user.target.wants
-        sudo ln -sf /etc/systemd/system/reboot_on_wifi_disconnect.service \
+        $SUDO mkdir -p /etc/systemd/system/multi-user.target.wants
+        $SUDO ln -sf /etc/systemd/system/reboot_on_wifi_disconnect.service \
             /etc/systemd/system/multi-user.target.wants/reboot_on_wifi_disconnect.service
     fi
 }
