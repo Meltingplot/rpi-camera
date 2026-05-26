@@ -9,8 +9,17 @@
 name: Upload Python Package
 
 on:
+  # Trigger on either:
+  #  - a pushed version tag (covers `git push origin <tag>` directly)
+  #  - publishing a release via the GitHub UI (release.published also fires
+  #    for pre-releases per GitHub's webhook docs)
+  #  - manual run from the Actions tab (useful for retries / debugging)
+  push:
+    tags:
+      - '[0-9]*'
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: read
