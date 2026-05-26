@@ -4,7 +4,50 @@ import click
 
 
 @click.command()
-def install():
+@click.option(
+    '--connection',
+    envvar='RPI_CAMERA_NM_CONNECTION',
+    default='preconfigured',
+    show_default=True,
+    help='NetworkManager connection name to modify with the static IP config.',
+)
+@click.option(
+    '--ip',
+    'address',
+    envvar='RPI_CAMERA_IP',
+    default='10.42.0.3/24',
+    show_default=True,
+    help='Static IPv4 address with CIDR to assign on the connection.',
+)
+@click.option(
+    '--gateway',
+    envvar='RPI_CAMERA_GATEWAY',
+    default='10.42.0.1',
+    show_default=True,
+    help='Default IPv4 gateway. Also used by the WiFi watchdog as the ping target.',
+)
+@click.option(
+    '--dns',
+    envvar='RPI_CAMERA_DNS',
+    default='10.42.0.1',
+    show_default=True,
+    help='DNS server.',
+)
+@click.option(
+    '--iface',
+    envvar='RPI_CAMERA_IFACE',
+    default='wlan0',
+    show_default=True,
+    help='WiFi interface name the watchdog monitors.',
+)
+@click.option(
+    '--configure-network',
+    envvar='RPI_CAMERA_CONFIGURE_NETWORK',
+    is_flag=True,
+    help='Opt in to nmcli static IP setup and the WiFi watchdog install. '
+    'Off by default — network config is expected to come from the Pi image itself.',
+)
+def install(connection, address, gateway, dns, iface, configure_network):
     """Install the RPi Camera as a systemd service."""
     import os
     import getpass
@@ -15,8 +58,6 @@ def install():
 
     # Get the path of the service file
     rpi_camera_service_file = os.path.join(sys.prefix, 'rpi-camera.service')
-
-    service_content = None
 
     # Read the content of the service file
     with open(rpi_camera_service_file, 'r') as file:
@@ -48,43 +89,62 @@ def install():
     # Make the rpi-camera command available outside the venv
     subprocess.run(['sudo', 'ln', '-sf', executable_file, '/usr/local/bin/rpi-camera'], check=True)
 
-    # Verify the NetworkManager connection we are about to modify actually exists,
-    # otherwise nmcli fails later with a cryptic error.
-    existing = subprocess.run(
-        ['nmcli', '-t', '-f', 'NAME', 'con', 'show'],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.splitlines()
-    if 'preconfigured' not in existing:
-        raise click.ClickException(
-            "NetworkManager connection 'preconfigured' not found — this installer "
-            "expects a Raspberry Pi OS image with the preconfigured WiFi setup.",
+    if not configure_network:
+        click.echo(
+            'Skipping network configuration and WiFi watchdog '
+            '(pass --configure-network or set RPI_CAMERA_CONFIGURE_NETWORK=1 to enable).',
+        )
+    else:
+        # Verify the NetworkManager connection we are about to modify actually exists,
+        # otherwise nmcli fails later with a cryptic error.
+        existing = subprocess.run(
+            ['nmcli', '-t', '-f', 'NAME', 'con', 'show'],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.splitlines()
+        if connection not in existing:
+            raise click.ClickException(
+                f"NetworkManager connection {connection!r} not found. Pass --connection / "
+                "RPI_CAMERA_NM_CONNECTION, or omit --configure-network to skip network setup entirely.",
+            )
+
+        click.echo(f'Configuring static IP {address} on connection {connection!r} via nmcli')
+
+        # Set address, gateway, DNS and method in a single atomic nmcli call
+        subprocess.run(
+            [
+                'sudo', 'nmcli', 'con', 'mod', connection,
+                'ipv4.addresses', address,
+                'ipv4.gateway', gateway,
+                'ipv4.dns', dns,
+                'ipv4.method', 'manual',
+            ],
+            check=True,
         )
 
-    click.echo('Configuring static IP for wlan0 using nmcli to 10.42.0.3')
+        # Bring the connection down and up to apply changes
+        subprocess.run(['sudo', 'nmcli', 'con', 'down', connection], check=True)
+        subprocess.run(['sudo', 'nmcli', 'con', 'up', connection], check=True)
 
-    # Set address, gateway, DNS and method in a single atomic nmcli call
-    subprocess.run(
-        [
-            'sudo', 'nmcli', 'con', 'mod', 'preconfigured',
-            'ipv4.addresses', '10.42.0.3/24',
-            'ipv4.gateway', '10.42.0.1',
-            'ipv4.dns', '10.42.0.1',
-            'ipv4.method', 'manual',
-        ],
-        check=True,
-    )
-
-    # Bring the connection down and up to apply changes
-    subprocess.run(['sudo', 'nmcli', 'con', 'down', 'preconfigured'], check=True)
-    subprocess.run(['sudo', 'nmcli', 'con', 'up', 'preconfigured'], check=True)
-
-    click.echo('Install reboot on wifi disconnect service')
-    wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
-    subprocess.run(['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'], check=True)
-    subprocess.run(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'], check=True)
-    subprocess.run(['sudo', '/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install'], check=True)
+        click.echo(f'Installing WiFi watchdog for iface={iface}, gateway={gateway}')
+        wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
+        subprocess.run(
+            ['sudo', 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'],
+            check=True,
+        )
+        subprocess.run(['sudo', 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'], check=True)
+        # `sudo VAR=val cmd` passes the env vars to the script (sudo's env strip
+        # normally hides them); the script bakes them into the systemd unit.
+        subprocess.run(
+            [
+                'sudo',
+                f'WIFI_IFACE={iface}',
+                f'GATEWAY={gateway}',
+                '/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install',
+            ],
+            check=True,
+        )
 
     # Reload the systemd daemon
     subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
