@@ -47,6 +47,7 @@ The two `StreamingServer`s (threaded `HTTPServer`s) are run via `loop.run_in_exe
 
 ## Conventions
 
+- **Local check order before commit/push: `yapf` → `flake8` → `pytest`.** yapf reformats in place (it can reflow argument lists across lines), which then changes what flake8 sees — running flake8 before yapf leads to noise that yapf would have fixed. pytest runs last because it depends on the linted code.
 - Python 3.10–3.12 (CI matrix). Line length 120 (flake8); yapf style in `.style.yapf`.
 - Packaging is PEP 517/621: all static metadata lives in `pyproject.toml` (deps, scripts, data-files, `[tool.versioneer]`, `[tool.setuptools.packages.find]` with `namespaces = true`). `setup.py` is a minimal versioneer shim that exists only so `versioneer.get_cmdclass()` can hook the build commands. Versioning via `versioneer` (git tags → `_version.py`); the project uses PEP 440 pre-release suffixes (`1.0.0rc1`, not `1.0.0-rc1`).
 - `meltingplot/` is a **PEP 420 namespace package** — it must not have an `__init__.py`, otherwise it blocks sibling distributions like `meltingplot.something_else`. Only subpackages (`meltingplot/rpi_camera/`, `meltingplot/rpi_camera/cli/`) carry an `__init__.py`.
