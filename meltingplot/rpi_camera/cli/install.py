@@ -1,6 +1,48 @@
 """Install the RPi Camera as a systemd service."""
 
+import os
+import shutil
+import subprocess
+
 import click
+
+
+# File-system mutations try the direct Python op first and only escalate
+# to sudo on PermissionError. This handles three environments uniformly:
+#   - root: direct op works, never falls through to sudo.
+#   - real Pi as user `pi` with passwordless sudo: direct fails on
+#     root-owned dirs, sudo fallback succeeds.
+#   - image-build chroot as `pi` with write access to the rootfs (typical
+#     pi-gen stages): direct op works, sudo isn't called at all so the
+#     missing interactive sudo password doesn't matter.
+def _copy(src, dst):
+    try:
+        shutil.copy(src, dst)
+    except PermissionError:
+        subprocess.run(['sudo', 'cp', src, dst], check=True)
+
+
+def _symlink(target, link):
+    try:
+        if os.path.lexists(link):
+            os.remove(link)
+        os.symlink(target, link)
+    except PermissionError:
+        subprocess.run(['sudo', 'ln', '-sf', target, link], check=True)
+
+
+def _chmod_exec(path):
+    try:
+        os.chmod(path, os.stat(path).st_mode | 0o111)
+    except PermissionError:
+        subprocess.run(['sudo', 'chmod', '+x', path], check=True)
+
+
+def _makedirs(path):
+    try:
+        os.makedirs(path, exist_ok=True)
+    except PermissionError:
+        subprocess.run(['sudo', 'mkdir', '-p', path], check=True)
 
 
 @click.command()
@@ -41,6 +83,45 @@ import click
     help='WiFi interface name the watchdog monitors.',
 )
 @click.option(
+    '--service-user',
+    envvar='RPI_CAMERA_SERVICE_USER',
+    default=None,
+    help='User to run the rpi-camera systemd service as. Defaults to the user invoking the '
+    'installer — override for image-build chroots where the installer runs as root but the '
+    'service should run as `pi`.',
+)
+@click.option(
+    '--service-group',
+    envvar='RPI_CAMERA_SERVICE_GROUP',
+    default=None,
+    help="Group to run the rpi-camera systemd service as. Defaults to the invoking user's "
+    "primary group.",
+)
+@click.option(
+    '--working-directory',
+    envvar='RPI_CAMERA_WORKING_DIRECTORY',
+    default=None,
+    help="WorkingDirectory= for the systemd service. Defaults to the invoking user's home "
+    "directory.",
+)
+@click.option(
+    '--ping-failures-before-reboot',
+    envvar='RPI_CAMERA_PING_FAILURES_BEFORE_REBOOT',
+    type=int,
+    default=30,
+    show_default=True,
+    help='WiFi watchdog: consecutive ping failures to the gateway before the safety-net '
+    'reboot fires (seconds, since the loop pings once per second).',
+)
+@click.option(
+    '--initial-association-timeout',
+    envvar='RPI_CAMERA_INITIAL_ASSOCIATION_TIMEOUT',
+    type=int,
+    default=120,
+    show_default=True,
+    help='WiFi watchdog: seconds to wait for the first WiFi association at boot before rebooting.',
+)
+@click.option(
     '--configure-network',
     envvar='RPI_CAMERA_CONFIGURE_NETWORK',
     is_flag=True,
@@ -55,18 +136,28 @@ import click
     help='Install the reboot-on-wifi-disconnect watchdog. Independent of --configure-network: '
     'the watchdog is camera-specific safety, not network setup.',
 )
-def install(connection, address, gateway, dns, iface, configure_network, wifi_watchdog):
+def install(
+    connection,
+    address,
+    gateway,
+    dns,
+    iface,
+    service_user,
+    service_group,
+    working_directory,
+    ping_failures_before_reboot,
+    initial_association_timeout,
+    configure_network,
+    wifi_watchdog,
+):
     """Install the RPi Camera as a systemd service."""
-    import os
     import getpass
     import grp
-    import subprocess
     import sys
     import tempfile
 
-    # Drop the `sudo` prefix when already root — image-build chroots typically
-    # run the install as root and don't have an interactive sudo password
-    # available. Skipping sudo there avoids `sudo: a password is required`.
+    # systemctl / nmcli have no safe direct equivalent and always need root.
+    # Skip the sudo prefix when already root so it isn't called at all.
     sudo = [] if os.geteuid() == 0 else ['sudo']
 
     # Get the path of the service file
@@ -76,14 +167,18 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
     with open(rpi_camera_service_file, 'r') as file:
         service_content = file.read()
 
-    # Replace User and Group with the current user and group
-    current_user = getpass.getuser()
-    current_group = grp.getgrgid(os.getgid()).gr_name
+    # Resolve user/group/home: explicit CLI/env wins, otherwise auto-detect from the
+    # invoking user. Auto-detect is wrong in image-build chroots (installer runs as
+    # root, target service should run as `pi`) — that case must set
+    # RPI_CAMERA_SERVICE_USER / _GROUP / _WORKING_DIRECTORY.
+    current_user = service_user or getpass.getuser()
+    current_group = service_group or grp.getgrgid(os.getgid()).gr_name
+    working_dir = working_directory or os.path.expanduser("~")
     service_content = service_content.replace('User=pi', f'User={current_user}', 1)
     service_content = service_content.replace('Group=pi', f'Group={current_group}', 1)
     service_content = service_content.replace(
         'WorkingDirectory=/home/pi',
-        f'WorkingDirectory={os.path.expanduser("~")}',
+        f'WorkingDirectory={working_dir}',
         1,
     )
 
@@ -158,12 +253,17 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
         subprocess.run([*sudo, 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'], check=True)
         # When non-root, sudo strips env, so we hand the env vars via the
         # `VAR=val cmd` form that sudo accepts. When root, plain env= works.
+        watchdog_env = {
+            'WIFI_IFACE': iface,
+            'GATEWAY': gateway,
+            'PING_FAILURES_BEFORE_REBOOT': str(ping_failures_before_reboot),
+            'INITIAL_ASSOCIATION_TIMEOUT': str(initial_association_timeout),
+        }
         if sudo:
             subprocess.run(
                 [
                     *sudo,
-                    f'WIFI_IFACE={iface}',
-                    f'GATEWAY={gateway}',
+                    *(f'{k}={v}' for k, v in watchdog_env.items()),
                     '/usr/local/bin/reboot_on_wifi_disconnect.sh',
                     'install',
                 ],
@@ -175,8 +275,7 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
                 check=True,
                 env={
                     **os.environ,
-                    'WIFI_IFACE': iface,
-                    'GATEWAY': gateway,
+                    **watchdog_env,
                 },
             )
     else:
