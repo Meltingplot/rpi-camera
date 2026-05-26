@@ -44,10 +44,18 @@ import click
     '--configure-network',
     envvar='RPI_CAMERA_CONFIGURE_NETWORK',
     is_flag=True,
-    help='Opt in to nmcli static IP setup and the WiFi watchdog install. '
-    'Off by default — network config is expected to come from the Pi image itself.',
+    help='Opt in to nmcli static IP setup on the chosen connection. '
+    'Off by default — IP config is expected to come from the Pi image itself.',
 )
-def install(connection, address, gateway, dns, iface, configure_network):
+@click.option(
+    '--wifi-watchdog/--no-wifi-watchdog',
+    envvar='RPI_CAMERA_WIFI_WATCHDOG',
+    default=True,
+    show_default=True,
+    help='Install the reboot-on-wifi-disconnect watchdog. Independent of --configure-network: '
+    'the watchdog is camera-specific safety, not network setup.',
+)
+def install(connection, address, gateway, dns, iface, configure_network, wifi_watchdog):
     """Install the RPi Camera as a systemd service."""
     import os
     import getpass
@@ -91,7 +99,7 @@ def install(connection, address, gateway, dns, iface, configure_network):
 
     if not configure_network:
         click.echo(
-            'Skipping network configuration and WiFi watchdog '
+            'Skipping nmcli static IP setup '
             '(pass --configure-network or set RPI_CAMERA_CONFIGURE_NETWORK=1 to enable).',
         )
     else:
@@ -106,7 +114,7 @@ def install(connection, address, gateway, dns, iface, configure_network):
         if connection not in existing:
             raise click.ClickException(
                 f"NetworkManager connection {connection!r} not found. Pass --connection / "
-                "RPI_CAMERA_NM_CONNECTION, or omit --configure-network to skip network setup entirely.",
+                "RPI_CAMERA_NM_CONNECTION, or omit --configure-network to skip nmcli setup.",
             )
 
         click.echo(f'Configuring static IP {address} on connection {connection!r} via nmcli')
@@ -127,6 +135,7 @@ def install(connection, address, gateway, dns, iface, configure_network):
         subprocess.run(['sudo', 'nmcli', 'con', 'down', connection], check=True)
         subprocess.run(['sudo', 'nmcli', 'con', 'up', connection], check=True)
 
+    if wifi_watchdog:
         click.echo(f'Installing WiFi watchdog for iface={iface}, gateway={gateway}')
         wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
         subprocess.run(
@@ -145,14 +154,28 @@ def install(connection, address, gateway, dns, iface, configure_network):
             ],
             check=True,
         )
+    else:
+        click.echo('Skipping WiFi watchdog install (--no-wifi-watchdog).')
 
-    # Reload the systemd daemon
-    subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+    # `/run/systemd/system` exists iff systemd is the active init AND running.
+    # In image-build chroots it's absent, so daemon-reload/start would fail —
+    # skip them and create the wants/ symlink manually (what `systemctl enable`
+    # does under the hood for WantedBy=multi-user.target).
+    systemd_running = os.path.isdir('/run/systemd/system')
 
-    # Enable the service
-    subprocess.run(['sudo', 'systemctl', 'enable', 'rpi-camera'], check=True)
-
-    # Start the service
-    subprocess.run(['sudo', 'systemctl', 'start', 'rpi-camera'], check=True)
-
-    click.echo('The RPi Camera has been installed as a systemd service.')
+    if systemd_running:
+        subprocess.run(['sudo', 'systemctl', 'daemon-reload'], check=True)
+        subprocess.run(['sudo', 'systemctl', 'enable', 'rpi-camera'], check=True)
+        subprocess.run(['sudo', 'systemctl', 'start', 'rpi-camera'], check=True)
+        click.echo('The RPi Camera has been installed as a systemd service.')
+    else:
+        wants_dir = '/etc/systemd/system/multi-user.target.wants'
+        subprocess.run(['sudo', 'mkdir', '-p', wants_dir], check=True)
+        subprocess.run(
+            ['sudo', 'ln', '-sf', '/etc/systemd/system/rpi-camera.service', f'{wants_dir}/rpi-camera.service'],
+            check=True,
+        )
+        click.echo(
+            'systemd is not running (image build?) — skipped daemon-reload/start, '
+            'created enable symlink manually. The service will come up on next boot.',
+        )

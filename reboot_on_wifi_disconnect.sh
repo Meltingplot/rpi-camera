@@ -42,14 +42,19 @@ Environment=INITIAL_ASSOCIATION_TIMEOUT=${INITIAL_ASSOCIATION_TIMEOUT}
 WantedBy=multi-user.target
 EOF
 
-    # Reload systemd manager configuration
-    sudo systemctl daemon-reload
-
-    # Enable the service to start on boot
-    sudo systemctl enable reboot_on_wifi_disconnect.service
-
-    # Start the service immediately
-    sudo systemctl start reboot_on_wifi_disconnect.service
+    # /run/systemd/system exists iff systemd is the active init AND running.
+    # In image-build chroots it's absent — skip daemon-reload/start and create
+    # the wants/ symlink by hand instead of calling `systemctl enable`.
+    if [ -d /run/systemd/system ]; then
+        sudo systemctl daemon-reload
+        sudo systemctl enable reboot_on_wifi_disconnect.service
+        sudo systemctl start reboot_on_wifi_disconnect.service
+    else
+        echo "systemd not running (image build?) — creating wants/ symlink manually."
+        sudo mkdir -p /etc/systemd/system/multi-user.target.wants
+        sudo ln -sf /etc/systemd/system/reboot_on_wifi_disconnect.service \
+            /etc/systemd/system/multi-user.target.wants/reboot_on_wifi_disconnect.service
+    fi
 }
 
 # Block until wlan0 associates for the first time, so the monitor loop's
