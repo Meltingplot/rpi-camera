@@ -173,7 +173,11 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
             subprocess.run(
                 ['/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install'],
                 check=True,
-                env={**os.environ, 'WIFI_IFACE': iface, 'GATEWAY': gateway},
+                env={
+                    **os.environ,
+                    'WIFI_IFACE': iface,
+                    'GATEWAY': gateway,
+                },
             )
     else:
         click.echo('Skipping WiFi watchdog install (--no-wifi-watchdog).')
