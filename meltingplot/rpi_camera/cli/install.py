@@ -122,11 +122,19 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
         # Set address, gateway, DNS and method in a single atomic nmcli call
         subprocess.run(
             [
-                'sudo', 'nmcli', 'con', 'mod', connection,
-                'ipv4.addresses', address,
-                'ipv4.gateway', gateway,
-                'ipv4.dns', dns,
-                'ipv4.method', 'manual',
+                'sudo',
+                'nmcli',
+                'con',
+                'mod',
+                connection,
+                'ipv4.addresses',
+                address,
+                'ipv4.gateway',
+                gateway,
+                'ipv4.dns',
+                dns,
+                'ipv4.method',
+                'manual',
             ],
             check=True,
         )
@@ -150,7 +158,8 @@ def install(connection, address, gateway, dns, iface, configure_network, wifi_wa
                 'sudo',
                 f'WIFI_IFACE={iface}',
                 f'GATEWAY={gateway}',
-                '/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install',
+                '/usr/local/bin/reboot_on_wifi_disconnect.sh',
+                'install',
             ],
             check=True,
         )
