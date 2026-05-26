@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=64", "wheel", "versioneer[toml]"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "meltingplot.rpi_camera"
+description = "RPi Camera MJPEG Streamer."
+readme = "README.rst"
+license = { file = "LICENSE" }
+authors = [{ name = "Tim Schneider", email = "tim@meltingplot.net" }]
+requires-python = ">=3.10"
+dynamic = ["version"]
+dependencies = [
+    "click",
+    "piexif",
+]
+
+[project.optional-dependencies]
+test = [
+    "pytest-cov",
+    "pytest-mock",
+    "pytest-asyncio",
+    "flake8",
+    "flake8-import-order",
+    "flake8-blind-except",
+    "flake8-builtins",
+    "flake8-docstrings",
+    "flake8-bugbear",
+    "flake8-comprehensions",
+    "flake8-commas",
+    "pep8-naming",
+    "bandit",
+    "yapf",
+    "twine",
+    "build",
+]
+
+[project.scripts]
+rpi-camera = "meltingplot.rpi_camera.__main__:main"
+
+[tool.setuptools]
+include-package-data = true
+zip-safe = false
+# install.py reads these from sys.prefix at runtime — keep them at the
+# install prefix root rather than inside the package.
+data-files = { "" = ["rpi-camera.service", "reboot_on_wifi_disconnect.sh"] }
+
+[tool.setuptools.packages.find]
+include = ["meltingplot*"]
+exclude = ["tests*", "docs*", "venv*"]
+# PEP 420 — `meltingplot` is a namespace shared with sibling distributions,
+# so it must NOT have an __init__.py. namespaces=true is the default but we
+# pin it explicitly to make the intent obvious.
+namespaces = true
+
+[tool.versioneer]
+VCS = "git"
+style = "pep440-pre"
+versionfile_source = "meltingplot/rpi_camera/_version.py"
+versionfile_build = "meltingplot/rpi_camera/_version.py"
+tag_prefix = ""

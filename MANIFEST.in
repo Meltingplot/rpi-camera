@@ -1,6 +1,7 @@
 include versioneer.py
-include meltingplot/rpi-camera/_version.py
+include meltingplot/rpi_camera/_version.py
 include README.rst
 include LICENSE
-include requirements.txt
-include requirements_test.txt
+include pyproject.toml
+include rpi-camera.service
+include reboot_on_wifi_disconnect.sh
