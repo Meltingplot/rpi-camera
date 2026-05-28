@@ -24,6 +24,7 @@ Endpoints (port 80):
     /picture/1/current/ or /snapshot: Serves the current frame as a JPEG image.
     GET /api/controls: Returns curated capabilities and currently applied state.
     POST /api/controls: Applies a partial control dict, persists it to JSON.
+    POST /api/controls/reset: Restores every control to its sensor default.
     POST /api/autofocus: Runs a one-shot autofocus cycle.
 Endpoints (port 8081):
     / or /webcam: Serves the MJPEG stream.
@@ -243,11 +244,13 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):  # noqa:N802
-        """Handle control updates and one-shot autofocus."""
+        """Handle control updates, reset, and one-shot autofocus."""
         url = urlparse(self.path)
 
         if url.path == '/api/controls':
             self._handle_apply_controls()
+        elif url.path == '/api/controls/reset':
+            self._handle_reset_controls()
         elif url.path == '/api/autofocus':
             self._handle_autofocus()
         else:
@@ -269,6 +272,19 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             return
         except Exception as exc:
             logging.warning('Failed to apply controls: %s', exc)
+            self._send_json(422, {'error': str(exc)})
+            return
+        self._send_json(200, {'state': new_state})
+
+    def _handle_reset_controls(self):
+        """Restore every supported control to its sensor default."""
+        if self.controller is None:
+            self.send_error(503, 'Controls unavailable')
+            return
+        try:
+            new_state = self.controller.reset()
+        except Exception as exc:
+            logging.warning('Failed to reset controls: %s', exc)
             self._send_json(422, {'error': str(exc)})
             return
         self._send_json(200, {'state': new_state})

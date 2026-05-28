@@ -101,6 +101,11 @@
   }
   button.action:hover { filter: brightness(1.1); }
   button.action:disabled { opacity: 0.5; cursor: default; }
+  button.action.secondary {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border);
+  }
+  button.action.secondary:hover { background: var(--bg); }
   #toast {
     position: fixed; right: 16px; bottom: 16px;
     background: var(--panel-2); border: 1px solid var(--border);
@@ -290,7 +295,10 @@
            <button class="action" id="af-trigger">Trigger one-shot autofocus</button></div>`
       : '';
 
-    root.innerHTML = sections + afButton;
+    const resetButton = `<div class="group"><h2>Reset</h2>
+       <button class="action secondary" id="controls-reset">Reset to defaults</button></div>`;
+
+    root.innerHTML = sections + afButton + resetButton;
     wireEvents();
   }
 
@@ -340,6 +348,24 @@
           .finally(() => {
             af.disabled = false;
             af.textContent = 'Trigger one-shot autofocus';
+          });
+      });
+    }
+    const resetBtn = document.getElementById('controls-reset');
+    if (resetBtn) {
+      resetBtn.addEventListener('click', () => {
+        resetBtn.disabled = true;
+        resetBtn.textContent = 'Resetting…';
+        fetch('/api/controls/reset', {method: 'POST'})
+          .then(r => r.ok ? r.json() : r.text().then(t => Promise.reject(new Error(t))))
+          .then(() => {
+            showToast('Controls reset to defaults', 'ok');
+            return refresh();
+          })
+          .catch(err => showToast(`Reset failed: ${err.message}`, 'bad'))
+          .finally(() => {
+            resetBtn.disabled = false;
+            resetBtn.textContent = 'Reset to defaults';
           });
       });
     }

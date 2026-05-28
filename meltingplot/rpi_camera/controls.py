@@ -125,6 +125,9 @@ CURATED_CONTROLS = {
         'label': 'Sharpness',
         'group': 'image',
         'step': 0.1,
+        # Curated app-level default that overrides the libcamera sensor
+        # default — see capabilities() / reset() for the precedence.
+        'default': 4.5,
     },
     'NoiseReductionMode': {
         'ui_type': 'select',
@@ -272,6 +275,35 @@ class CameraController:
             self._save_locked()
             return dict(self._state)
 
+    def reset(self):
+        """Reset every supported control to its default and wipe state.
+
+        For each supported control we prefer the curated app-level default
+        (set in :data:`CURATED_CONTROLS` — e.g. ``Sharpness: 4.5``) and fall
+        back to the libcamera sensor default from ``camera_controls``.
+        ``self._state`` and the persisted JSON file are then cleared so a
+        subsequent restart also starts blank. Controls that have neither a
+        curated nor a sensor default (e.g. the virtual ``FrameRate``) are
+        skipped — their current value stands.
+        """
+        info = self._picam2.camera_controls
+        defaults = {}
+        for name in self._supported:
+            curated = CURATED_CONTROLS.get(name, {}).get('default')
+            if curated is not None:
+                defaults[name] = _to_libcamera(name, curated)
+                continue
+            bounds = info.get(name)
+            if bounds is not None and bounds[2] is not None:
+                defaults[name] = bounds[2]
+
+        with self._lock:
+            if defaults:
+                self._picam2.set_controls(defaults)
+            self._state = {}
+            self._save_locked()
+            return dict(self._state)
+
     def trigger_autofocus(self, timeout=5.0):
         """Run a one-shot AF cycle and return the resulting state.
 
@@ -311,17 +343,30 @@ class CameraController:
         return {'state': 'timeout', 'last': last_state}
 
     def load_and_apply_persisted(self):
-        """Read the persistence file (if any) and push it to the camera.
+        """Apply curated defaults plus any persisted user changes to the camera.
 
+        Precedence (lowest to highest): libcamera sensor defaults (already in
+        place after Picamera2 init) < curated app-level defaults from
+        :data:`CURATED_CONTROLS` < persisted user changes from the JSON file.
         Called once from ``start()`` after the camera is initialised. Unknown
-        keys are skipped, so a JSON file written by an HQ-module install
+        keys in the JSON are skipped so a file written by an HQ-module install
         survives a swap to a v2 module without crashing the service.
         """
+        defaults = {}
+        for name in self._supported:
+            curated = CURATED_CONTROLS.get(name, {}).get('default')
+            if curated is not None:
+                defaults[name] = _to_libcamera(name, curated)
+        if defaults:
+            with self._lock:
+                self._picam2.set_controls(defaults)
+            log.info('Applied %d curated defaults', len(defaults))
+
         try:
             with open(self._persist_path, 'r') as fh:
                 persisted = json.load(fh)
         except FileNotFoundError:
-            log.info('No persisted controls at %s, starting with sensor defaults', self._persist_path)
+            log.info('No persisted controls at %s', self._persist_path)
             return
         except (OSError, json.JSONDecodeError) as exc:
             log.warning('Could not read persisted controls (%s); ignoring', exc)
