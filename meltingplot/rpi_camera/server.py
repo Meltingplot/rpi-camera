@@ -29,6 +29,7 @@ Usage:
 import asyncio
 import io
 import logging
+import signal
 import socketserver
 import subprocess
 from http import server
@@ -373,12 +374,20 @@ async def _run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog
     stream = StreamingServer(('', stream_port), StreamingHandler)
     servers = (http, stream)
 
+    # SIGTERM has no default Python translation; without this handler systemd's
+    # stop signal terminates the process before the finally below can release
+    # the camera and close sockets, forcing systemd to SIGKILL after its timeout.
+    # SIGINT is already turned into KeyboardInterrupt by asyncio.run.
+    stop_event = asyncio.Event()
+    loop.add_signal_handler(signal.SIGTERM, stop_event.set)
+
     server_futures = [loop.run_in_executor(None, s.serve_forever) for s in servers]
     watchdog_task = asyncio.create_task(
         watchdog(frame_buffer, interval=watchdog_interval, grace_period=watchdog_grace_period),
     )
-    pending = (*server_futures, watchdog_task)
-    labels = ('http server', 'stream server', 'watchdog')
+    stop_task = asyncio.create_task(stop_event.wait())
+    pending = (*server_futures, watchdog_task, stop_task)
+    labels = ('http server', 'stream server', 'watchdog', 'stop signal')
 
     try:
         await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -389,6 +398,7 @@ async def _run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog
             s.shutdown()
             s.server_close()
         watchdog_task.cancel()
+        stop_task.cancel()
         results = await asyncio.gather(*pending, return_exceptions=True)
         for label, result in zip(labels, results):
             if isinstance(result, Exception) and not isinstance(result, asyncio.CancelledError):
