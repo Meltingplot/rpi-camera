@@ -13,10 +13,32 @@ check_wlan0_connected() {
     iw dev "$WIFI_IFACE" link | grep -q "Connected"
 }
 
-# Check whether the gateway is reachable. Used only as a slow safety net —
-# transient packet loss should not trigger a reboot on its own.
+# Resolve the IP to ping. Prefer the live default route on $WIFI_IFACE so
+# this works on both the original static point-to-point network (gateway
+# 10.42.0.1, baked into $GATEWAY) and on any DHCP network the Pi happens to
+# join (gateway assigned by DHCP — never matches $GATEWAY). Fall back to a
+# generic default route, and finally to the legacy $GATEWAY env var so an
+# old config never silently breaks.
+current_gateway() {
+    local gw
+    gw=$(ip route show default dev "$WIFI_IFACE" 2>/dev/null | awk '/^default/ {print $3; exit}')
+    if [ -z "$gw" ]; then
+        gw=$(ip route show default 2>/dev/null | awk '/^default/ {print $3; exit}')
+    fi
+    if [ -z "$gw" ]; then
+        gw="$GATEWAY"
+    fi
+    echo "$gw"
+}
+
+# Check whether the current default gateway is reachable. Used only as a
+# slow safety net — transient packet loss should not trigger a reboot on
+# its own. -W 1 bounds the ICMP wait at one second so a 1 Hz outer loop
+# stays accurate when the gateway is dropping packets.
 check_ip_reachable() {
-    ping -c 1 "$GATEWAY" &> /dev/null
+    local gw
+    gw=$(current_gateway)
+    [ -n "$gw" ] && ping -c 1 -W 1 "$gw" &> /dev/null
 }
 
 # Function to install the systemd service.
@@ -91,7 +113,8 @@ monitor_wifi() {
         if ! check_ip_reachable; then
             ping_failures=$((ping_failures + 1))
             if [ "$ping_failures" -ge "$PING_FAILURES_BEFORE_REBOOT" ]; then
-                echo "Gateway ${GATEWAY} unreachable for ${PING_FAILURES_BEFORE_REBOOT}s. Rebooting (safety net)..."
+                gw=$(current_gateway)
+                echo "Gateway ${gw:-<none>} unreachable for ${PING_FAILURES_BEFORE_REBOOT}s. Rebooting (safety net)..."
                 reboot
             fi
         else
