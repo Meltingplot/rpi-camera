@@ -17,18 +17,26 @@ Classes:
 Functions:
     main: The main function that configures the camera, starts recording, and sets up the HTTP servers.
 HTML Page:
-    The HTML page includes a link to the stream and a link to fetch the current frame.
-Endpoints:
+    The HTML page (loaded from package data web/index.html) hosts the live
+    stream view and a control panel that talks to /api/controls.
+Endpoints (port 80):
     / or /index.html: Serves the HTML page.
-    /picture/1/current/: Serves the current frame as a JPEG image.
-    /webcam: Serves the MJPEG stream.
+    /picture/1/current/ or /snapshot: Serves the current frame as a JPEG image.
+    GET /api/controls: Returns curated capabilities and currently applied state.
+    POST /api/controls: Applies a partial control dict, persists it to JSON.
+    POST /api/autofocus: Runs a one-shot autofocus cycle.
+Endpoints (port 8081):
+    / or /webcam: Serves the MJPEG stream.
 Usage:
     Run the script to start the HTTP servers on ports 80 and 8081.
 """
 
 import asyncio
+import importlib.resources
 import io
+import json
 import logging
+import os
 import signal
 import socketserver
 import subprocess
@@ -46,8 +54,13 @@ from picamera2.outputs import FileOutput
 
 import piexif
 
+from .controls import CameraController
 
-PAGE = """\
+# Fallback HTML for environments where the package data isn't installed
+# (e.g. someone running the source tree directly without `pip install -e .`).
+# The full UI lives in meltingplot/rpi_camera/web/index.html and is loaded
+# from package data at startup; this stub is only the legacy minimal page.
+_FALLBACK_PAGE = """\
 <html>
 <head>
 <title>Meltingplot RPi Camera MJPEG streaming</title>
@@ -174,14 +187,21 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
 
 
 class HttpHandler(server.BaseHTTPRequestHandler):
-    """A request handler for serving the HTML page and current frame as a JPEG image."""
+    """A request handler for the HTML page, snapshots, and the JSON control API."""
 
     frame_buffer = None
     # Pre-rendered landing page bytes; templated with the stream port at start time.
     page_bytes = None
+    # CameraController instance shared across handler threads. None means the
+    # control API endpoints respond 503 (camera initialised without controls).
+    controller = None
+
+    # The MJPEG hot path lives on a separate StreamingServer (port 8081) and
+    # never goes through this handler — so the JSON control endpoints below
+    # cannot starve frame delivery, even under POST flood.
 
     def do_GET(self):  # noqa:N802
-        """Serve the HTML page or the current frame as a JPEG image."""
+        """Serve the HTML page, current frame as JPEG, or current control state."""
         url = urlparse(self.path)
 
         if url.path in ('/', '/index.html'):
@@ -207,9 +227,94 @@ class HttpHandler(server.BaseHTTPRequestHandler):
                 self.wfile.write(frame)
             except Exception as e:
                 logging.warning('Removed client %s: %s', self.client_address, str(e))
+        elif url.path == '/api/controls':
+            if self.controller is None:
+                self.send_error(503, 'Controls unavailable')
+                return
+            self._send_json(
+                200,
+                {
+                    'capabilities': self.controller.capabilities(),
+                    'state': self.controller.get_state(),
+                },
+            )
         else:
             self.send_error(404)
             self.end_headers()
+
+    def do_POST(self):  # noqa:N802
+        """Handle control updates and one-shot autofocus."""
+        url = urlparse(self.path)
+
+        if url.path == '/api/controls':
+            self._handle_apply_controls()
+        elif url.path == '/api/autofocus':
+            self._handle_autofocus()
+        else:
+            self.send_error(404)
+            self.end_headers()
+
+    def _handle_apply_controls(self):
+        """Apply a partial control dict and echo the merged state back."""
+        if self.controller is None:
+            self.send_error(503, 'Controls unavailable')
+            return
+        body = self._read_json_body()
+        if body is None:
+            return  # _read_json_body already sent the error
+        try:
+            new_state = self.controller.apply(body)
+        except ValueError as exc:
+            self._send_json(400, {'error': str(exc)})
+            return
+        except Exception as exc:
+            logging.warning('Failed to apply controls: %s', exc)
+            self._send_json(422, {'error': str(exc)})
+            return
+        self._send_json(200, {'state': new_state})
+
+    def _handle_autofocus(self):
+        """Run the one-shot autofocus cycle and return its outcome."""
+        if self.controller is None:
+            self.send_error(503, 'Controls unavailable')
+            return
+        body = self._read_json_body(allow_empty=True) or {}
+        timeout = float(body.get('timeout', 5.0))
+        try:
+            result = self.controller.trigger_autofocus(timeout=timeout)
+        except RuntimeError as exc:
+            self._send_json(400, {'error': str(exc)})
+            return
+        except Exception as exc:
+            logging.warning('Autofocus failed: %s', exc)
+            self._send_json(422, {'error': str(exc)})
+            return
+        self._send_json(200, result)
+
+    def _read_json_body(self, allow_empty=False):
+        """Read and parse a JSON request body, sending an error response on failure."""
+        length = int(self.headers.get('Content-Length') or 0)
+        if length == 0:
+            if allow_empty:
+                return None
+            self._send_json(400, {'error': 'empty body'})
+            return None
+        raw = self.rfile.read(length)
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._send_json(400, {'error': f'invalid JSON: {exc}'})
+            return None
+
+    def _send_json(self, status, payload):
+        """Serialise ``payload`` as JSON and write it as a complete response."""
+        body = json.dumps(payload).encode('utf-8')
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', len(body))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
@@ -302,6 +407,14 @@ async def watchdog(frame_buffer, interval=2, grace_period=30):
     help='Seconds the watchdog waits at startup before enforcing the frame-counter check.',
 )
 @click.option(
+    '--controls-file',
+    type=click.Path(dir_okay=False),
+    default=None,
+    show_default=False,
+    help='JSON file used to persist UI control changes across restarts. '
+    'Default: ~/.config/meltingplot-rpi-camera/controls.json.',
+)
+@click.option(
     '--log-level',
     type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
     default='INFO',
@@ -318,6 +431,7 @@ def start(
     autofocus,
     watchdog_interval,
     watchdog_grace_period,
+    controls_file,
     log_level,
 ):
     """
@@ -334,7 +448,7 @@ def start(
 
     frame_buffer = StreamingOutput(rotation=int(rotation))
     HttpHandler.frame_buffer = frame_buffer
-    HttpHandler.page_bytes = PAGE.replace('__STREAM_PORT__', str(stream_port)).encode('utf-8')
+    HttpHandler.page_bytes = _load_page_bytes(stream_port)
     StreamingHandler.frame_buffer = frame_buffer
 
     try:
@@ -362,9 +476,34 @@ def start(
         else:
             picam2.set_controls(wanted_controls)
 
+        # Wire up the live control API. Persisted values (if any) override the
+        # CLI defaults applied above, so a saved exposure/AF setting survives
+        # a watchdog reboot.
+        persist_path = controls_file or os.path.join(
+            os.path.expanduser('~'),
+            '.config',
+            'meltingplot-rpi-camera',
+            'controls.json',
+        )
+        controller = CameraController(picam2, persist_path)
+        controller.load_and_apply_persisted()
+        HttpHandler.controller = controller
+
         asyncio.run(_run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog_grace_period))
     finally:
         picam2.stop_recording()
+
+
+def _load_page_bytes(stream_port):
+    """Read the bundled landing page from package data and template the stream port."""
+    try:
+        html = importlib.resources.files('meltingplot.rpi_camera').joinpath('web/index.html').read_text(
+            encoding='utf-8',
+        )
+    except (FileNotFoundError, ModuleNotFoundError) as exc:
+        logging.warning('Bundled landing page not found (%s); falling back to legacy page', exc)
+        html = _FALLBACK_PAGE
+    return html.replace('__STREAM_PORT__', str(stream_port)).encode('utf-8')
 
 
 async def _run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog_grace_period):

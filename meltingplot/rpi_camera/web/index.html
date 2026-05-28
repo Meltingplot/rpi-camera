@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Meltingplot RPi Camera</title>
+<style>
+  :root {
+    --bg: #111;
+    --panel: #1d1d22;
+    --panel-2: #25252c;
+    --text: #e8e8ea;
+    --muted: #8a8a93;
+    --accent: #4ea1ff;
+    --border: #2e2e36;
+    --bad: #ff6b6b;
+    --ok: #4ed09b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 12px 20px; border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .links { display: flex; gap: 16px; }
+  header a { color: var(--accent); text-decoration: none; font-size: 13px; }
+  header a:hover { text-decoration: underline; }
+  main {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 360px;
+    gap: 0;
+    height: calc(100vh - 49px);
+  }
+  @media (max-width: 900px) {
+    main { grid-template-columns: 1fr; height: auto; }
+    #stream-pane { height: 50vh; }
+  }
+  #stream-pane {
+    background: #000;
+    display: flex; align-items: center; justify-content: center;
+    overflow: hidden;
+  }
+  #stream {
+    width: 100%; height: 100%; object-fit: contain;
+  }
+  #controls-pane {
+    background: var(--panel);
+    border-left: 1px solid var(--border);
+    overflow-y: auto;
+    padding: 16px;
+  }
+  .group { margin-bottom: 22px; }
+  .group h2 {
+    font-size: 11px; text-transform: uppercase; letter-spacing: 1.2px;
+    color: var(--muted); margin: 0 0 10px 0; font-weight: 600;
+  }
+  .control {
+    background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 6px;
+    padding: 10px 12px; margin-bottom: 8px;
+  }
+  .control.disabled { opacity: 0.45; pointer-events: none; }
+  .control-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px; margin-bottom: 6px;
+  }
+  .control-label { font-weight: 500; }
+  .control-value { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
+  .control input[type=range] { width: 100%; }
+  .control select, .control input[type=number] {
+    background: var(--bg); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 8px; font: inherit; width: 100%;
+  }
+  .control .pair { display: flex; gap: 8px; }
+  .control .pair input { flex: 1; }
+  .toggle-row { display: flex; align-items: center; gap: 10px; }
+  .toggle-row .control-label { flex: 1; }
+  .switch {
+    width: 38px; height: 22px; background: var(--bg);
+    border: 1px solid var(--border); border-radius: 11px;
+    position: relative; cursor: pointer;
+    transition: background 0.15s;
+  }
+  .switch::after {
+    content: ''; position: absolute; top: 2px; left: 2px;
+    width: 16px; height: 16px; border-radius: 50%;
+    background: var(--muted); transition: left 0.15s, background 0.15s;
+  }
+  .switch.on { background: var(--accent); }
+  .switch.on::after { left: 18px; background: #fff; }
+  button.action {
+    background: var(--accent); color: #fff; border: 0;
+    padding: 8px 14px; border-radius: 4px; cursor: pointer;
+    font: inherit; font-weight: 500; width: 100%;
+  }
+  button.action:hover { filter: brightness(1.1); }
+  button.action:disabled { opacity: 0.5; cursor: default; }
+  #toast {
+    position: fixed; right: 16px; bottom: 16px;
+    background: var(--panel-2); border: 1px solid var(--border);
+    padding: 8px 14px; border-radius: 4px; font-size: 13px;
+    transform: translateY(120%); transition: transform 0.2s;
+  }
+  #toast.show { transform: translateY(0); }
+  #toast.bad { border-color: var(--bad); color: var(--bad); }
+  #toast.ok { border-color: var(--ok); color: var(--ok); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Meltingplot RPi Camera</h1>
+  <div class="links">
+    <a id="streamLink" href="" target="_blank">Stream URL</a>
+    <a href="/picture/1/current/" target="_blank">Snapshot</a>
+  </div>
+</header>
+<main>
+  <div id="stream-pane">
+    <img id="stream" alt="Live MJPEG stream">
+  </div>
+  <div id="controls-pane">
+    <div id="controls-root">Loading controls…</div>
+  </div>
+</main>
+<div id="toast"></div>
+<script>
+(function() {
+  const STREAM_PORT = '__STREAM_PORT__';
+  const streamLink = document.getElementById('streamLink');
+  const streamImg = document.getElementById('stream');
+  const root = document.getElementById('controls-root');
+  const toast = document.getElementById('toast');
+
+  const streamUrl = `http://${window.location.hostname}:${STREAM_PORT}/`;
+  streamLink.href = streamUrl;
+  streamImg.src = streamUrl;
+
+  const GROUPS = [
+    ['exposure', 'Exposure'],
+    ['white_balance', 'White balance'],
+    ['image', 'Image'],
+    ['focus', 'Focus'],
+    ['capture', 'Capture'],
+  ];
+
+  let state = {};
+  let capabilities = {};
+  let toastTimer = null;
+
+  function showToast(msg, kind) {
+    toast.textContent = msg;
+    toast.className = 'show ' + (kind || '');
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toast.className = ''; }, 2500);
+  }
+
+  function valueOrDefault(name, meta) {
+    if (state[name] !== undefined) return state[name];
+    if (meta.default !== undefined) return meta.default;
+    if (meta.options) return meta.options[0];
+    if (meta.ui_type === 'toggle') return false;
+    if (meta.ui_type === 'pair') return [1.0, 1.0];
+    return 0;
+  }
+
+  function isDisabled(meta) {
+    if (meta.disabled_when) {
+      for (const [k, v] of Object.entries(meta.disabled_when)) {
+        if (state[k] === v) return true;
+      }
+    }
+    if (meta.disabled_when_not) {
+      for (const [k, v] of Object.entries(meta.disabled_when_not)) {
+        if (state[k] !== v) return true;
+      }
+    }
+    return false;
+  }
+
+  const debounceTimers = {};
+  function postControl(name, value) {
+    clearTimeout(debounceTimers[name]);
+    debounceTimers[name] = setTimeout(() => {
+      fetch('/api/controls', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({[name]: value}),
+      }).then(async resp => {
+        if (!resp.ok) {
+          const text = await resp.text();
+          showToast(`${name}: ${resp.status} ${text}`, 'bad');
+          return;
+        }
+        const data = await resp.json();
+        state = data.state || state;
+        render();
+      }).catch(err => showToast(`${name}: ${err.message}`, 'bad'));
+    }, 180);
+  }
+
+  function renderSlider(name, meta) {
+    const val = Number(valueOrDefault(name, meta));
+    const min = meta.min ?? 0;
+    const max = meta.max ?? 1;
+    const step = meta.step ?? ((max - min) / 100);
+    const displayVal = (typeof val === 'number' && !Number.isInteger(val)) ? val.toFixed(2) : val;
+    return `
+      <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
+        <div class="control-row">
+          <span class="control-label">${meta.label}</span>
+          <span class="control-value" data-value-of="${name}">${displayVal}</span>
+        </div>
+        <input type="range" data-name="${name}" data-kind="slider"
+               min="${min}" max="${max}" step="${step}" value="${val}">
+      </div>`;
+  }
+
+  function renderToggle(name, meta) {
+    const val = !!valueOrDefault(name, meta);
+    return `
+      <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
+        <div class="toggle-row">
+          <span class="control-label">${meta.label}</span>
+          <div class="switch ${val ? 'on' : ''}" data-name="${name}" data-kind="toggle"></div>
+        </div>
+      </div>`;
+  }
+
+  function renderSelect(name, meta) {
+    const val = valueOrDefault(name, meta);
+    const opts = meta.options.map(o => `<option value="${o}" ${o === val ? 'selected' : ''}>${o}</option>`).join('');
+    return `
+      <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
+        <div class="control-row">
+          <span class="control-label">${meta.label}</span>
+        </div>
+        <select data-name="${name}" data-kind="select">${opts}</select>
+      </div>`;
+  }
+
+  function renderPair(name, meta) {
+    const val = valueOrDefault(name, meta);
+    const a = Array.isArray(val) ? val[0] : 1.0;
+    const b = Array.isArray(val) ? val[1] : 1.0;
+    const min = meta.min ?? 0;
+    const max = meta.max ?? 8;
+    const step = meta.step ?? 0.1;
+    return `
+      <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
+        <div class="control-row">
+          <span class="control-label">${meta.label}</span>
+        </div>
+        <div class="pair">
+          <input type="number" data-name="${name}" data-kind="pair" data-index="0"
+                 min="${min}" max="${max}" step="${step}" value="${a}">
+          <input type="number" data-name="${name}" data-kind="pair" data-index="1"
+                 min="${min}" max="${max}" step="${step}" value="${b}">
+        </div>
+      </div>`;
+  }
+
+  function renderControl(name, meta) {
+    switch (meta.ui_type) {
+      case 'slider': return renderSlider(name, meta);
+      case 'toggle': return renderToggle(name, meta);
+      case 'select': return renderSelect(name, meta);
+      case 'pair':   return renderPair(name, meta);
+      default:       return '';
+    }
+  }
+
+  function render() {
+    const sections = GROUPS.map(([key, title]) => {
+      const items = Object.entries(capabilities)
+        .filter(([, meta]) => meta.group === key)
+        .map(([name, meta]) => renderControl(name, meta))
+        .join('');
+      if (!items) return '';
+      return `<div class="group"><h2>${title}</h2>${items}</div>`;
+    }).join('');
+
+    const afButton = capabilities.AfMode
+      ? `<div class="group"><h2>Focus action</h2>
+           <button class="action" id="af-trigger">Trigger one-shot autofocus</button></div>`
+      : '';
+
+    root.innerHTML = sections + afButton;
+    wireEvents();
+  }
+
+  function wireEvents() {
+    root.querySelectorAll('[data-kind=slider]').forEach(el => {
+      el.addEventListener('input', () => {
+        const name = el.dataset.name;
+        const value = parseFloat(el.value);
+        const valEl = root.querySelector(`[data-value-of="${name}"]`);
+        if (valEl) valEl.textContent = Number.isInteger(value) ? value : value.toFixed(2);
+        postControl(name, value);
+      });
+    });
+    root.querySelectorAll('[data-kind=toggle]').forEach(el => {
+      el.addEventListener('click', () => {
+        const name = el.dataset.name;
+        const newVal = !el.classList.contains('on');
+        el.classList.toggle('on', newVal);
+        postControl(name, newVal);
+      });
+    });
+    root.querySelectorAll('[data-kind=select]').forEach(el => {
+      el.addEventListener('change', () => postControl(el.dataset.name, el.value));
+    });
+    root.querySelectorAll('[data-kind=pair]').forEach(el => {
+      el.addEventListener('change', () => {
+        const name = el.dataset.name;
+        const pair = [...root.querySelectorAll(`[data-name="${name}"]`)]
+          .sort((a, b) => Number(a.dataset.index) - Number(b.dataset.index))
+          .map(i => parseFloat(i.value));
+        postControl(name, pair);
+      });
+    });
+    const af = document.getElementById('af-trigger');
+    if (af) {
+      af.addEventListener('click', () => {
+        af.disabled = true;
+        af.textContent = 'Focusing…';
+        fetch('/api/autofocus', {method: 'POST'})
+          .then(r => r.json())
+          .then(data => {
+            const lp = data.lens_position != null ? ` (lens ${Number(data.lens_position).toFixed(2)})` : '';
+            showToast(`Autofocus: ${data.state}${lp}`, data.state === 'Focused' ? 'ok' : 'bad');
+            return refresh();
+          })
+          .catch(err => showToast(`Autofocus failed: ${err.message}`, 'bad'))
+          .finally(() => {
+            af.disabled = false;
+            af.textContent = 'Trigger one-shot autofocus';
+          });
+      });
+    }
+  }
+
+  function refresh() {
+    return fetch('/api/controls')
+      .then(r => r.json())
+      .then(data => {
+        capabilities = data.capabilities || {};
+        state = data.state || {};
+        render();
+      })
+      .catch(err => { root.textContent = 'Failed to load controls: ' + err.message; });
+  }
+
+  refresh();
+})();
+</script>
+</body>
+</html>
