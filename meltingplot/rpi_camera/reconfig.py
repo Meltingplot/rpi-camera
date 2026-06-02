@@ -1,21 +1,24 @@
 # -*- coding: utf-8 -*-
-"""Coordinate camera + USB-gadget reconfiguration on resolution/fps changes.
+"""Coordinate camera reconfiguration on resolution/fps changes.
 
-Resolution and frame rate are not live libcamera controls: changing them
-means re-configuring the Picamera2 pipeline and rewriting the UVC gadget
-descriptors (which forces a USB re-enumeration on the host). This module
-owns that sequence so a UI change to either value reconfigures the camera
-and the gadget consistently.
+Frame rate is a live libcamera control; resolution is not — changing it
+means re-configuring the Picamera2 pipeline (stop/start recording). This
+module owns that sequence so a UI change to either value is applied safely.
+
+The USB UVC gadget needs **no** reconfiguration here: its configfs
+descriptors are provisioned once at boot for the worst case the UI allows
+(1080p @ 30 fps, see rpi-cam-gadget-setup.sh). MJPEG is self-describing, so
+the pump streams any capture resolution <= that envelope into the same node
+without a USB re-enumeration, and paces delivery to the capture fps. The
+pump is therefore started once and kept running across reconfigures.
 
 The work runs on a dedicated worker thread fed by a coalescing queue, so
 the HTTP control handler that triggered the change returns immediately
-instead of blocking for the seconds a reconfigure + USB reconnect takes.
+instead of blocking for the seconds a pipeline reconfigure takes.
 """
 
 import logging
-import os
 import queue
-import subprocess
 import threading
 
 from libcamera import controls as libcontrols
@@ -43,21 +46,23 @@ def parse_resolution(value, fallback):
 
 
 class ReconfigCoordinator:
-    """Own the camera recording, the UVC pump, and the gadget descriptors.
+    """Own the camera recording and the UVC pump.
 
     ``bring_up`` performs the initial configure/record/pump synchronously.
     ``on_change`` (a :class:`CameraController` listener) enqueues later
-    Resolution/FrameRate changes, which the worker applies one at a time.
+    Resolution/FrameRate changes from the web UI, which the worker applies one
+    at a time. While a USB host is streaming the camera as a UVC webcam, the
+    host owns the resolution/fps (via the pump's COMMIT callback) and UI-driven
+    changes are ignored.
     """
 
-    def __init__(self, picam2, frame_buffer, *, transform, autofocus, enable_uvc, gadget_helper):
+    def __init__(self, picam2, frame_buffer, *, transform, autofocus, enable_uvc):
         """Bind dependencies and start the reconfigure worker thread."""
         self._picam2 = picam2
         self._frame_buffer = frame_buffer
         self._transform = transform
         self._autofocus = autofocus
         self._enable_uvc = enable_uvc
-        self._gadget_helper = gadget_helper
         self._controller = None
         self._lock = threading.RLock()
         self._pump = None
@@ -65,6 +70,8 @@ class ReconfigCoordinator:
         self._width = None
         self._height = None
         self._fps = None
+        self._host_streaming = False  # set by the UVC pump while a host streams
+        self._stream_listener = None  # optional callback(active: bool)
         self._queue = queue.Queue()
         self._worker = threading.Thread(target=self._worker_loop, name='reconfig', daemon=True)
         self._worker.start()
@@ -73,6 +80,10 @@ class ReconfigCoordinator:
         """Attach the controller so live controls can be re-applied after a reconfigure."""
         self._controller = controller
 
+    def register_stream_listener(self, callback):
+        """Register a ``callback(active: bool)`` fired when the host opens/closes the UVC stream."""
+        self._stream_listener = callback
+
     def bring_up(self, width, height, framerate):
         """Run the initial synchronous configure + record + gadget + pump."""
         with self._lock:
@@ -80,12 +91,32 @@ class ReconfigCoordinator:
 
     def on_change(self, merged_state, changed):
         """Enqueue a Resolution/FrameRate change for the worker (returns at once)."""
+        if self._host_streaming:
+            # The USB host owns resolution/fps while it streams; ignore the UI.
+            log.info('Ignoring UI Resolution/FrameRate change while USB host is streaming')
+            return
         width, height = parse_resolution(
             merged_state.get('Resolution'),
             (self._width or 1280, self._height or 720),
         )
         fps = int(merged_state.get('FrameRate', self._fps or 4))
         self._queue.put((width, height, fps))
+
+    # -- UVC pump callbacks (run on the pump thread) -------------------
+    def _on_host_format(self, width, height, fps):
+        """Reconfigure the camera to the format the USB host just COMMITted."""
+        log.info('USB host selected %dx%d @ %d fps', width, height, fps)
+        self._queue.put((width, height, fps))
+
+    def _on_stream_state(self, active):
+        """Toggle host ownership and notify listeners when the host opens/closes the stream."""
+        self._host_streaming = active
+        log.info('USB host UVC stream %s', 'started' if active else 'stopped')
+        if self._stream_listener is not None:
+            try:
+                self._stream_listener(active)
+            except Exception:
+                log.exception('stream listener failed')
 
     def stop(self):
         """Stop the pump and recording (called on server shutdown)."""
@@ -124,11 +155,6 @@ class ReconfigCoordinator:
             return
         log.info('Reconfigure: %dx%d @ %d fps', width, height, fps)
 
-        # Pause the pump while the gadget node is torn down / recreated.
-        if self._pump is not None:
-            self._pump.stop()
-            self._pump = None
-
         if force or size_changed:
             if self._recording:
                 self._picam2.stop_recording()
@@ -149,9 +175,12 @@ class ReconfigCoordinator:
 
         self._width, self._height, self._fps = width, height, fps
 
-        if self._enable_uvc:
-            self._reconfigure_gadget(width, height, fps)
-            self._start_pump(width, height, fps)
+        # The UVC gadget descriptors are static (the host negotiates one of the
+        # advertised frames via PROBE/COMMIT), so a resolution/fps change never
+        # touches USB or re-enumerates: the pump keeps running and shuttles the
+        # new (self-describing) JPEGs. Only ensure it is up.
+        if self._enable_uvc and self._pump is None:
+            self._start_pump()
 
     def _apply_camera_controls(self, fps):
         # A configure() resets all controls, so re-apply autofocus default,
@@ -171,24 +200,19 @@ class ReconfigCoordinator:
         except Exception as exc:
             log.warning('FrameRate %d not applied: %s', fps, exc)
 
-    def _reconfigure_gadget(self, width, height, fps):
-        if not self._gadget_helper or not os.path.exists('/run/rpi-cam-gadget.enabled'):
-            return
-        try:
-            subprocess.run(
-                ['sudo', self._gadget_helper, str(width),
-                 str(height), str(fps)],
-                check=True,
-                timeout=20,
-            )
-        except Exception:
-            log.exception('UVC gadget reconfigure helper failed')
-
-    def _start_pump(self, width, height, fps):
+    def _start_pump(self):
         device = UvcGadget.find_device()
         if not device:
             log.info('No UVC gadget output node found; UVC disabled')
             return
         log.info('UVC gadget node: %s', device)
-        self._pump = UvcGadget(device, width, height, fps, lambda: self._frame_buffer.frame)
+        # The host picks the resolution/fps from the advertised set; the pump
+        # calls back here to reconfigure the camera and to flag when the host
+        # is streaming. It reads frames from the shared frame buffer.
+        self._pump = UvcGadget(
+            device,
+            self._frame_buffer,
+            on_host_format=self._on_host_format,
+            on_stream_state=self._on_stream_state,
+        )
         self._pump.start()

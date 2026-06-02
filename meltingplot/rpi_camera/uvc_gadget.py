@@ -8,11 +8,17 @@ frames; the kernel forwards both as events on that node and expects a
 userspace process to (a) answer the PROBE/COMMIT control negotiation and
 (b) feed frames into queued buffers. This module is that process.
 
-Scope (MVP, plan step 6): a **single MJPEG format** at one fixed
-resolution — no dynamic resolution/fps reconfiguration, no governor. The
-descriptors are written by the image's gadget-setup script; here we only
-answer with a matching streaming-control and pump the latest JPEG from
-the camera's frame buffer.
+Scope: the configfs descriptors (written once by the image's gadget-setup
+script) advertise a **single MJPEG format with several frame sizes** and are
+never rewritten at runtime. The USB host picks a resolution/fps via
+PROBE/COMMIT; this pump honours that ``bFrameIndex``, asks the coordinator to
+drive picamera2 to it, sizes its buffers to the chosen frame, and feeds the
+JPEGs into the node — so the host negotiates resolution the regular UVC way,
+with no descriptor rewrite or USB re-enumeration. Delivery is **paced to the
+camera's frame rate**: a new buffer is queued only when a new frame appears
+(signalled via an eventfd), so a low fps costs no extra CPU or USB bandwidth
+(the isochronous endpoint simply idles between frames instead of re-sending
+duplicate frames).
 
 This is intricate kernel-ABI code. ioctl numbers are computed at runtime
 from ``ctypes.sizeof`` so they are correct for whatever ABI we run on
@@ -32,6 +38,79 @@ import struct
 import threading
 
 log = logging.getLogger(__name__)
+
+# --- Static gadget envelope -------------------------------------------
+# The configfs descriptors (rpi-cam-gadget-setup.sh) provision the UVC
+# function ONCE for a per-board "envelope" (the largest frame the board is
+# expected to ever stream) and are never rewritten at runtime. The pump
+# advertises and sizes its buffers for that same envelope; a smaller capture
+# resolution just yields a smaller (self-describing) JPEG that the host
+# decodes at its embedded size, with no USB re-enumeration.
+MAX_FPS = 30
+# Advertised MJPEG frame intervals (100 ns units), fastest first:
+# 30/15/10/5/4/2/1 fps. MUST match the dwFrameInterval list written by
+# rpi-cam-gadget-setup.sh.
+FRAME_INTERVALS = (333333, 666666, 1000000, 2000000, 2500000, 5000000, 10000000)
+# Mirrors streaming_maxpacket in rpi-cam-gadget-setup.sh (high-bandwidth
+# iso: 2048 B/microframe). Reported to the host in PROBE/COMMIT so it sizes
+# its payload requests to match the endpoint.
+_ISO_MAXPACKET = 2048
+
+
+def _read_board_model():
+    """Return the Raspberry Pi model string, or '' if it can't be read."""
+    try:
+        with open('/proc/device-tree/model', 'rb') as fh:
+            # The device-tree string is NUL-terminated.
+            return fh.read().decode('utf-8', 'replace').rstrip('\x00').strip()
+    except OSError:
+        return ''
+
+
+def gadget_frames(model=None):
+    """Ordered list of advertised MJPEG frame sizes ``[(w, h), ...]`` for this board.
+
+    The 1-based index into this list IS the UVC ``bFrameIndex`` the host
+    negotiates, so ``rpi-cam-gadget-setup.sh`` MUST create the configfs frames
+    in this exact (ascending) order for the indices to line up. The largest
+    entry is bounded per board to what the hardware can sensibly stream:
+
+    * single-core Pi Zero / Zero W -> up to 1280x720  (ARMv6, mem + CPU bound)
+    * Pi Zero 2 W                  -> up to 1920x1080
+    * everything else (Pi 4/5/...) -> up to 4608x2592 (IMX708 full sensor)
+
+    The host (UVC consumer) picks one of these; the pump then drives picamera2
+    to the chosen size, so no descriptor rewrite / USB re-enumeration occurs.
+    """
+    if model is None:
+        model = _read_board_model()
+    if 'Zero 2' in model:
+        return [(640, 480), (1280, 720), (1920, 1080)]
+    if 'Zero' in model:
+        return [(640, 480), (1280, 720)]
+    return [(640, 480), (1280, 720), (1920, 1080), (2304, 1296), (4608, 2592)]
+
+
+def _default_frame_index(frames):
+    """1-based default ``bFrameIndex`` — 720p where present, else the first."""
+    for i, (w, h) in enumerate(frames, start=1):
+        if (w, h) == (1280, 720):
+            return i
+    return 1
+
+
+def _fps_from_interval(interval):
+    """Convert a UVC ``dwFrameInterval`` (100 ns units) to an integer fps."""
+    if interval <= 0:
+        return MAX_FPS
+    return max(1, min(MAX_FPS, round(10_000_000 / interval)))
+
+
+def _clamp_interval(interval):
+    """Clamp a requested frame interval to the advertised [fastest, slowest]."""
+    lo, hi = FRAME_INTERVALS[0], FRAME_INTERVALS[-1]
+    return max(lo, min(hi, interval)) if interval > 0 else lo
+
 
 # --- ioctl number construction (asm-generic _IOC, used by arm) ---------
 _IOC_NRBITS = 8
@@ -324,37 +403,58 @@ VIDIOC_DQEVENT = _ior('V', 89, V4l2Event)
 VIDIOC_SUBSCRIBE_EVENT = _iow('V', 90, V4l2EventSubscription)
 UVCIOC_SEND_RESPONSE = _iow('U', 1, UvcRequestData)
 
-_NUM_BUFFERS = 6
+# Frame-gating queues at most one buffer per new camera frame, so a small
+# ring (one transmitting, one just-filled, a couple spare) is plenty — and at
+# the full-sensor envelope each buffer is large, so we keep the count low.
+_NUM_BUFFERS = 4
 
 
 class UvcGadget(threading.Thread):
     """Pump camera JPEGs into the UVC gadget node in a background thread.
 
+    The host (UVC consumer) chooses the resolution/fps from the advertised
+    set (:func:`gadget_frames`); the pump honours that ``bFrameIndex``, sizes
+    its buffers to the chosen frame, and asks the coordinator to reconfigure
+    picamera2 to match — no descriptor rewrite or USB re-enumeration.
+
     Args:
         device: gadget V4L2 output node, e.g. ``/dev/video0``.
-        width, height: the single advertised frame size (must match the
-            descriptors written into configfs by the gadget-setup script).
-        fps: frames per second for the advertised ``dwFrameInterval``.
-        get_frame: callable returning the latest JPEG bytes (or ``None``).
+        frame_buffer: the shared :class:`StreamingOutput`; the pump reads
+            ``.frame`` (latest JPEG bytes), ``.frame_counter`` (to detect a
+            new frame) and waits on ``.condition`` to pace delivery.
+        on_host_format: optional ``callback(width, height, fps)`` invoked when
+            the host COMMITs a format, so the camera can be reconfigured.
+        on_stream_state: optional ``callback(active: bool)`` invoked when the
+            host opens (True) / closes (False) the UVC stream, so the HTTP
+            server can yield the camera while it is bound as a webcam.
     """
 
-    def __init__(self, device, width, height, fps, get_frame):
-        """Bind the pump to a gadget node, resolution and frame source."""
+    def __init__(self, device, frame_buffer, on_host_format=None, on_stream_state=None):
+        """Bind the pump to a gadget node, the frame buffer and coordinator callbacks."""
         super().__init__(name='uvc-gadget', daemon=True)
         self._device = device
-        self._width = int(width)
-        self._height = int(height)
-        self._interval = max(1, int(10_000_000 // max(1, int(fps))))  # 100 ns units
-        self._max_frame = self._width * self._height * 2  # generous MJPEG bound
-        self._get_frame = get_frame
+        self._frame_buffer = frame_buffer
+        self._on_host_format = on_host_format
+        self._on_stream_state = on_stream_state
+        # eventfd the frame buffer pokes on every new frame, so the select()
+        # loop can block on "new frame OR V4L2 event" with no timeout/poll.
+        self._wake_fd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
+        self._frames = gadget_frames()
+        self._frame_index = _default_frame_index(self._frames)  # 1-based bFrameIndex
+        self._interval = FRAME_INTERVALS[0]  # advertised default: 30 fps
+        self._width, self._height = self._frames[self._frame_index - 1]
+        # Buffers are sized to the *committed* frame at STREAMON; 1 byte/pixel
+        # is a safe MJPEG ceiling (~3-5x the largest realistic frame).
+        self._max_frame = self._width * self._height
         self._fd = -1
         self._stop = threading.Event()
         self._streaming = False
-        self._buffers = []  # list of mmap objects
-        self._probe = self._make_streaming_control()
-        self._commit = self._make_streaming_control()
+        self._buffers = []  # list of mmap objects, indexed by buffer index
+        self._free = []  # indices of buffers we own and may fill/queue
+        self._last_counter = -1  # frame_counter last pushed to the gadget
+        self._probe = self._control_for(self._frame_index, self._interval)
+        self._commit = self._control_for(self._frame_index, self._interval)
         self._dqevent_fails = 0
-        self._fill_calls = 0
         self._empty_fills = 0
         self._dqbuf_errs = 0
 
@@ -388,14 +488,22 @@ class UvcGadget(threading.Thread):
         return None
 
     # -- control negotiation ------------------------------------------
-    def _make_streaming_control(self):
+    def _control_for(self, frame_index, interval):
+        """Build a streaming control for a given (1-based) frame index + interval."""
+        frame_index = max(1, min(len(self._frames), frame_index))
+        width, height = self._frames[frame_index - 1]
         ctrl = UvcStreamingControl()
         ctrl.bmHint = 1
-        ctrl.bFormatIndex = 1
-        ctrl.bFrameIndex = 1
-        ctrl.dwFrameInterval = self._interval
-        ctrl.dwMaxVideoFrameSize = self._max_frame
-        ctrl.dwMaxPayloadTransferSize = 1024
+        ctrl.bFormatIndex = 1  # single MJPEG format
+        ctrl.bFrameIndex = frame_index
+        ctrl.dwFrameInterval = _clamp_interval(interval)
+        # 1 byte/pixel ceiling for the selected frame (matches buffer sizing).
+        ctrl.dwMaxVideoFrameSize = width * height
+        # Match the iso endpoint (streaming_maxpacket) so the host sizes its
+        # payload requests correctly, and advertise the 48 MHz UVC clock the
+        # gadget uses for presentation timestamps.
+        ctrl.dwMaxPayloadTransferSize = _ISO_MAXPACKET
+        ctrl.dwClockFrequency = 48_000_000
         ctrl.bmFramingInfo = 3
         ctrl.bPreferedVersion = 1
         ctrl.bMinVersion = 1
@@ -405,6 +513,10 @@ class UvcGadget(threading.Thread):
     def stop(self):
         """Signal the thread to stop and wake the select loop."""
         self._stop.set()
+        try:
+            os.eventfd_write(self._wake_fd, 1)  # break the blocking select()
+        except OSError:
+            pass
 
     # -- thread entry --------------------------------------------------
     def run(self):
@@ -413,7 +525,10 @@ class UvcGadget(threading.Thread):
             self._fd = os.open(self._device, os.O_RDWR | os.O_NONBLOCK)
         except OSError as exc:
             log.error('UVC: cannot open %s (%s); pump disabled', self._device, exc)
+            self._close_wake()
             return
+        # Get woken on every new camera frame via the eventfd.
+        self._frame_buffer.add_wake_fd(self._wake_fd)
         try:
             self._subscribe_events()
             log.info('UVC: subscribed to events on %s, entering loop', self._device)
@@ -421,10 +536,21 @@ class UvcGadget(threading.Thread):
         except Exception:  # never let the pump take down the process
             log.exception('UVC: pump thread crashed; gadget streaming disabled')
         finally:
+            self._frame_buffer.remove_wake_fd(self._wake_fd)
             self._teardown_stream()
             if self._fd >= 0:
                 os.close(self._fd)
                 self._fd = -1
+            self._close_wake()
+
+    def _close_wake(self):
+        """Close the wake eventfd (idempotent)."""
+        if self._wake_fd >= 0:
+            try:
+                os.close(self._wake_fd)
+            except OSError:
+                pass
+            self._wake_fd = -1
 
     def _subscribe_events(self):
         for ev in (
@@ -439,12 +565,14 @@ class UvcGadget(threading.Thread):
             fcntl.ioctl(self._fd, VIDIOC_SUBSCRIBE_EVENT, sub)
 
     def _loop(self):
+        fb = self._frame_buffer
         while not self._stop.is_set():
-            wfds = [self._fd] if self._streaming else []
-            # Exception set carries V4L2 events; write set carries buffer
-            # readiness on the output node.
+            # One blocking wait on both sources: V4L2 events arrive on the
+            # exception set; a new camera frame (or stop()) pokes the eventfd
+            # on the read set. No timeout, no poll — the loop only wakes when
+            # there is actually something to do.
             try:
-                _, ready_w, ready_x = select.select([], wfds, [self._fd], 0.5)
+                ready_r, _, ready_x = select.select([self._wake_fd], [], [self._fd])
             except OSError:
                 break
             if ready_x:
@@ -454,11 +582,30 @@ class UvcGadget(threading.Thread):
                 if self._dqevent_fails > 20:
                     log.error('UVC: giving up after repeated DQEVENT failures; pump stopped')
                     return
+            if ready_r:
+                self._drain_wake()
             # Re-check _streaming: a STREAMOFF handled just above may have
-            # torn the stream down, and DQBUF on the stopped stream would
-            # raise EINVAL on every disconnect.
-            if ready_w and self._streaming:
-                self._process_frame()
+            # torn the stream down, so DQBUF/QBUF would raise EINVAL.
+            if not self._streaming:
+                continue
+            # Reclaim every buffer the gadget has finished transmitting, then
+            # push the current frame — but only once per *new* camera frame.
+            # Between frames the queue is left to drain and the gadget sends
+            # zero-length iso packets (normal webcam underrun), so we neither
+            # burn CPU re-copying nor re-send duplicate frames over USB.
+            self._reclaim_buffers()
+            counter = fb.frame_counter
+            frame = fb.frame
+            if frame and counter != self._last_counter:
+                if self._push_frame(frame):
+                    self._last_counter = counter
+
+    def _drain_wake(self):
+        """Clear the wake eventfd (one read resets its accumulated counter)."""
+        try:
+            os.eventfd_read(self._wake_fd)
+        except OSError:
+            pass
 
     # -- event handling ------------------------------------------------
     def _handle_event(self):
@@ -512,33 +659,57 @@ class UvcGadget(threading.Thread):
             self._pending_cs = cs
             self._send_response(bytes(ctypes.sizeof(UvcStreamingControl)))
             return
-        # GET_* requests: answer PROBE/COMMIT with our single streaming control.
+        # GET_* requests on PROBE/COMMIT: report the negotiable range so the
+        # host can enumerate resolutions, and the current/default selection.
         if cs in (UVC_VS_PROBE_CONTROL, UVC_VS_COMMIT_CONTROL):
             if req.bRequest == UVC_GET_LEN:
                 self._send_response(struct.pack('<H', ctypes.sizeof(UvcStreamingControl)))
             elif req.bRequest == UVC_GET_INFO:
                 self._send_response(b'\x03')  # GET/SET supported
-            else:  # GET_CUR/MIN/MAX/DEF/RES
+            elif req.bRequest == UVC_GET_MIN:
+                # Smallest frame, fastest interval.
+                self._send_response(bytes(self._control_for(1, FRAME_INTERVALS[0])))
+            elif req.bRequest == UVC_GET_MAX:
+                # Largest frame, slowest interval.
+                self._send_response(bytes(self._control_for(len(self._frames), FRAME_INTERVALS[-1])))
+            elif req.bRequest == UVC_GET_DEF:
+                self._send_response(bytes(self._control_for(_default_frame_index(self._frames), FRAME_INTERVALS[0])))
+            else:  # GET_CUR / GET_RES
                 self._send_response(bytes(self._probe))
         else:
             self._send_response(b'')
 
     def _handle_data(self, data):
-        # Payload of a SET_CUR on PROBE or COMMIT — accept and mirror it.
+        # Payload of a SET_CUR on PROBE or COMMIT — read the host's chosen
+        # frame index + interval, clamp to what we advertise, and echo back a
+        # consistent control.
         cs = getattr(self, '_pending_cs', UVC_VS_PROBE_CONTROL)
-        log.debug('UVC: data for cs=%d length=%d', cs, data.length)
         length = min(max(0, data.length), ctypes.sizeof(UvcStreamingControl))
         raw = bytes(data.data)[:length]
-        ctrl = UvcStreamingControl.from_buffer_copy(
+        req = UvcStreamingControl.from_buffer_copy(
             raw + b'\x00' * (ctypes.sizeof(UvcStreamingControl) - len(raw)),
         )
-        # Force our single supported format/frame regardless of host choice.
-        ctrl.bFormatIndex = 1
-        ctrl.bFrameIndex = 1
-        ctrl.dwFrameInterval = self._interval
-        ctrl.dwMaxVideoFrameSize = self._max_frame
+        frame_index = req.bFrameIndex if 1 <= req.bFrameIndex <= len(self._frames) else self._frame_index
+        interval = _clamp_interval(req.dwFrameInterval)
+        ctrl = self._control_for(frame_index, interval)
+        log.debug(
+            'UVC: %s data -> frame %d %dx%d @ %d fps',
+            'COMMIT' if cs == UVC_VS_COMMIT_CONTROL else 'PROBE',
+            frame_index,
+            *self._frames[frame_index - 1],
+            _fps_from_interval(interval),
+        )
         if cs == UVC_VS_COMMIT_CONTROL:
             self._commit = ctrl
+            self._frame_index = frame_index
+            self._interval = interval
+            self._width, self._height = self._frames[frame_index - 1]
+            # Drive the camera to the host's choice (head start before STREAMON).
+            if self._on_host_format is not None:
+                try:
+                    self._on_host_format(self._width, self._height, _fps_from_interval(interval))
+                except Exception:
+                    log.exception('UVC: on_host_format callback failed')
         else:
             self._probe = ctrl
 
@@ -553,30 +724,46 @@ class UvcGadget(threading.Thread):
             log.debug('UVC: send_response failed: %s', exc)
 
     # -- streaming -----------------------------------------------------
+    def _notify_stream(self, active):
+        """Fire the stream-state callback, swallowing any error."""
+        if self._on_stream_state is None:
+            return
+        try:
+            self._on_stream_state(active)
+        except Exception:
+            log.exception('UVC: on_stream_state(%s) callback failed', active)
+
     def _start_stream(self):
         if self._streaming:
             return
         try:
-            probe = None
-            try:
-                probe = self._get_frame()
-            except Exception:
-                probe = None
+            # Size buffers to the host-committed frame (set in _handle_data).
+            self._max_frame = self._width * self._height
+            frame = self._frame_buffer.frame
             log.info(
                 'UVC: frame source at streamon: %s',
-                ('%d bytes' % len(probe)) if probe else 'EMPTY/None',
+                ('%d bytes' % len(frame)) if frame else 'EMPTY/None',
             )
             self._set_format()
             log.debug('UVC: S_FMT ok')
             self._request_buffers(_NUM_BUFFERS)
             log.debug('UVC: REQBUFS got %d buffers', len(self._buffers))
-            # Queue every buffer (each is filled with the latest frame).
-            for index in range(len(self._buffers)):
-                self._queue_buffer(index)
+            # Prime a single buffer with the current frame so the host gets an
+            # immediate first image; the rest stay free for the pacing loop,
+            # which queues one buffer per new camera frame.
+            if frame:
+                self._push_frame(frame)
+                self._last_counter = self._frame_buffer.frame_counter
             on = ctypes.c_int(V4L2_BUF_TYPE_VIDEO_OUTPUT)
             fcntl.ioctl(self._fd, VIDIOC_STREAMON, on)
             self._streaming = True
-            log.info('UVC: streaming %dx%d started', self._width, self._height)
+            log.info(
+                'UVC: streaming started %dx%d @ %d fps',
+                self._width,
+                self._height,
+                _fps_from_interval(self._interval),
+            )
+            self._notify_stream(True)
         except OSError as exc:
             log.error('UVC: failed to start streaming: %s', exc)
             self._teardown_stream()
@@ -598,6 +785,7 @@ class UvcGadget(threading.Thread):
         req.memory = V4L2_MEMORY_MMAP
         fcntl.ioctl(self._fd, VIDIOC_REQBUFS, req)
         self._buffers = []
+        self._free = list(range(req.count))
         for index in range(req.count):
             buf = V4l2Buffer()
             buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
@@ -621,44 +809,43 @@ class UvcGadget(threading.Thread):
             )
             self._buffers.append(mm)
 
-    def _fill_buffer(self, index):
-        frame = None
-        try:
-            frame = self._get_frame()
-        except Exception as exc:
-            log.warning('UVC: get_frame raised: %s', exc)
-            frame = None
-        mm = self._buffers[index]
-        self._fill_calls += 1
-        if not frame:
-            self._empty_fills += 1
-            if self._empty_fills <= 3 or self._empty_fills % 300 == 0:
-                log.warning('UVC: no frame to send (empty fill #%d)', self._empty_fills)
-            return 0
+    def _fill_buffer(self, index, frame):
         # len(mm) is the mapped length; mm.size() is the backing file size,
         # which is 0 for a V4L2 device fd — using it here yielded 0-byte frames.
+        mm = self._buffers[index]
         size = min(len(frame), len(mm))
         mm.seek(0)
         mm.write(frame[:size])
-        if self._fill_calls <= 3:
-            log.debug('UVC: filled buffer %d with %d bytes', index, size)
         return size
 
-    def _queue_buffer(self, index):
+    def _push_frame(self, frame):
+        # Queue exactly one free buffer with this frame. If none is free (the
+        # gadget hasn't returned a buffer yet) we simply drop the frame — a
+        # webcam skipping a frame is harmless and avoids any blocking wait.
+        if not self._free:
+            self._empty_fills += 1
+            if self._empty_fills <= 3 or self._empty_fills % 300 == 0:
+                log.debug('UVC: no free buffer for frame (#%d)', self._empty_fills)
+            return False
+        index = self._free.pop(0)
+        size = self._fill_buffer(index, frame)
         buf = V4l2Buffer()
         buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
         buf.memory = V4L2_MEMORY_MMAP
         buf.index = index
-        # bytesused must reflect the JPEG length we wrote.
-        frame_len = self._fill_buffer(index)
-        buf.bytesused = frame_len
+        buf.bytesused = size  # must reflect the JPEG length we wrote
         buf.length = len(self._buffers[index])
-        fcntl.ioctl(self._fd, VIDIOC_QBUF, buf)
+        try:
+            fcntl.ioctl(self._fd, VIDIOC_QBUF, buf)
+        except OSError as exc:
+            log.debug('UVC: QBUF failed: %s', exc)
+            self._free.append(index)  # hand the buffer back
+            return False
+        return True
 
-    def _process_frame(self):
-        # Drain every buffer the gadget has finished with this wake-up and
-        # requeue each with the latest frame, so the queue stays full and
-        # the host underruns (-ENODATA) as little as the single core allows.
+    def _reclaim_buffers(self):
+        # Drain every buffer the gadget has finished transmitting back onto
+        # the free list so the next new frame can reuse it.
         while True:
             buf = V4l2Buffer()
             buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
@@ -667,23 +854,22 @@ class UvcGadget(threading.Thread):
                 fcntl.ioctl(self._fd, VIDIOC_DQBUF, buf)
             except OSError as exc:
                 if exc.errno == errno.EAGAIN:
-                    return  # no more ready buffers — normal
+                    return  # no more finished buffers — normal
                 self._dqbuf_errs += 1
                 if self._dqbuf_errs <= 3:
                     log.warning('UVC: DQBUF failed: %s', exc)
-                # A wedged DQBUF leaves POLLOUT permanently set, which would
-                # spin this loop at 100% and starve the (single-core) camera
-                # into a watchdog reboot. Stop streaming so the loop idles.
                 if self._dqbuf_errs > 10 and self._streaming:
                     log.error('UVC: too many DQBUF failures; stopping stream to avoid CPU starvation')
                     self._teardown_stream()
                 return
             self._dqbuf_errs = 0
-            self._queue_buffer(buf.index)
+            if buf.index not in self._free:
+                self._free.append(buf.index)
 
     def _teardown_stream(self):
         if self._fd < 0:
             return
+        was_streaming = self._streaming
         if self._streaming:
             try:
                 off = ctypes.c_int(V4L2_BUF_TYPE_VIDEO_OUTPUT)
@@ -691,12 +877,20 @@ class UvcGadget(threading.Thread):
             except OSError:
                 pass
             self._streaming = False
+        if was_streaming:
+            self._notify_stream(False)
+        self._release_buffers()
+
+    def _release_buffers(self):
+        """Unmap the buffers and free the V4L2 queue (REQBUFS count=0)."""
         for mm in self._buffers:
             try:
                 mm.close()
             except (OSError, ValueError):
                 pass
         self._buffers = []
+        self._free = []
+        self._last_counter = -1
         try:
             req = V4l2Requestbuffers()
             req.count = 0

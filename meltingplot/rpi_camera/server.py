@@ -107,6 +107,10 @@ class StreamingOutput(io.BufferedIOBase):
         self.condition = Condition()
         self.frame_counter = 0
         self.rotation = rotation
+        # eventfds to poke on every new frame, so a select()-based consumer
+        # (the UVC pump) can wait on "new frame" without polling. Guarded by
+        # ``condition``; see add_wake_fd / write.
+        self._wake_fds = []
 
         # EXIF Orientation tag — only needed for rotations the sensor can't do.
         # See http://sylvana.net/jpegcrop/exif_orientation.html
@@ -132,6 +136,19 @@ class StreamingOutput(io.BufferedIOBase):
         flip = self.rotation == 180
         return Transform(hflip=flip, vflip=flip)
 
+    def add_wake_fd(self, fd):
+        """Register an eventfd poked (os.eventfd_write) on every new frame."""
+        with self.condition:
+            self._wake_fds.append(fd)
+
+    def remove_wake_fd(self, fd):
+        """Unregister a previously added eventfd (before the consumer closes it)."""
+        with self.condition:
+            try:
+                self._wake_fds.remove(fd)
+            except ValueError:
+                pass
+
     def write(self, buf):
         """Write the buffer to the stream and notify waiting threads.
 
@@ -147,6 +164,13 @@ class StreamingOutput(io.BufferedIOBase):
                 self.frame = b"".join((buf[:2], self._jpeg_app1, buf[2:]))
             self.frame_counter += 1
             self.condition.notify_all()
+            # Wake any select()-based consumer (UVC pump). Non-blocking; a
+            # closed/removed fd is simply skipped.
+            for fd in self._wake_fds:
+                try:
+                    os.eventfd_write(fd, 1)
+                except OSError:
+                    pass
 
 
 class StreamingHandler(server.BaseHTTPRequestHandler):
@@ -487,14 +511,6 @@ def _default_resolution(model=None):
     'No-op on boards/images without the gadget configured.',
 )
 @click.option(
-    '--gadget-reconfig-helper',
-    envvar='RPI_CAMERA_GADGET_RECONFIG_HELPER',
-    default='/usr/local/sbin/rpi-cam-gadget-reconfig.sh',
-    show_default=True,
-    help='Privileged helper (run via sudo) that rewrites the UVC gadget '
-    'descriptors and re-binds the UDC on a resolution/fps change.',
-)
-@click.option(
     '--log-level',
     type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
     default='INFO',
@@ -513,7 +529,6 @@ def start(
     watchdog_grace_period,
     controls_file,
     enable_uvc,
-    gadget_reconfig_helper,
     log_level,
 ):
     """
@@ -566,7 +581,6 @@ def start(
         transform=frame_buffer.hw_transform,
         autofocus=autofocus,
         enable_uvc=enable_uvc,
-        gadget_helper=gadget_reconfig_helper,
     )
     coordinator.set_controller(controller)
     controller.register_change_listener(coordinator.on_change)
