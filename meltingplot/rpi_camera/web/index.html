@@ -115,6 +115,21 @@
   #toast.show { transform: translateY(0); }
   #toast.bad { border-color: var(--bad); color: var(--bad); }
   #toast.ok { border-color: var(--ok); color: var(--ok); }
+  #host-banner {
+    display: none;
+    background: var(--accent); color: #04263f;
+    padding: 10px 20px; font-weight: 600; text-align: center; font-size: 13px;
+  }
+  #stream-overlay {
+    display: none; color: var(--muted); text-align: center;
+    padding: 24px; max-width: 420px; line-height: 1.6;
+  }
+  /* While a USB host owns the camera: show the banner + overlay, hide the
+     (now unavailable) live stream, and grey the controls out. */
+  body.host-active #host-banner { display: block; }
+  body.host-active #stream { display: none; }
+  body.host-active #stream-overlay { display: block; }
+  body.host-active #controls-pane { opacity: 0.45; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -125,9 +140,17 @@
     <a href="/picture/1/current/" target="_blank">Snapshot</a>
   </div>
 </header>
+<div id="host-banner">
+  Camera is bound as a USB (UVC) webcam — the live view and settings are managed by the connected host.
+</div>
 <main>
   <div id="stream-pane">
     <img id="stream" alt="Live MJPEG stream">
+    <div id="stream-overlay">
+      <strong>Camera in use as a USB (UVC) webcam.</strong><br>
+      The connected host controls the live view and camera settings.
+      This page resumes automatically once the USB stream stops.
+    </div>
   </div>
   <div id="controls-pane">
     <div id="controls-root">Loading controls…</div>
@@ -375,12 +398,37 @@
     return fetch('/api/controls')
       .then(r => r.json())
       .then(data => {
+        applyHostActive(!!data.host_active);
         capabilities = data.capabilities || {};
         state = data.state || {};
         render();
       })
       .catch(err => { root.textContent = 'Failed to load controls: ' + err.message; });
   }
+
+  // While a USB host streams the camera as a UVC webcam it owns the device:
+  // the live view (port 8081) and the control API both return 503/409, so we
+  // grey the page out and resume automatically when the host disconnects.
+  let hostActive = false;
+  function applyHostActive(active) {
+    if (active === hostActive) return;
+    hostActive = active;
+    document.body.classList.toggle('host-active', active);
+    if (active) {
+      streamImg.src = '';  // stop hammering the now-unavailable stream
+    } else {
+      streamImg.src = streamUrl + '?t=' + Date.now();  // reconnect
+      refresh();  // controls are writable again — reload state
+    }
+  }
+
+  function pollStatus() {
+    fetch('/api/status')
+      .then(r => r.json())
+      .then(d => applyHostActive(!!d.host_active))
+      .catch(() => {});
+  }
+  setInterval(pollStatus, 2000);
 
   refresh();
 })();

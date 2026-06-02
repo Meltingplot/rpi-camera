@@ -22,10 +22,14 @@ HTML Page:
 Endpoints (port 80):
     / or /index.html: Serves the HTML page.
     /picture/1/current/ or /snapshot: Serves the current frame as a JPEG image.
-    GET /api/controls: Returns curated capabilities and currently applied state.
+    GET /api/controls: Returns curated capabilities and currently applied state (plus host_active).
     POST /api/controls: Applies a partial control dict, persists it to JSON.
     POST /api/controls/reset: Restores every control to its sensor default.
     POST /api/autofocus: Runs a one-shot autofocus cycle.
+    GET /api/status: Reports whether a USB host currently owns the camera (UVC).
+While a USB host streams the camera as a UVC webcam it owns the device: the
+MJPEG stream and snapshot return 503, control writes return 409, and the web
+UI greys out — resuming automatically once the host stops streaming.
 Endpoints (port 8081):
     / or /webcam: Serves the MJPEG stream.
 Usage:
@@ -42,7 +46,7 @@ import signal
 import socketserver
 import subprocess
 from http import server
-from threading import Condition, Semaphore
+from threading import Condition, Event, Semaphore
 from urllib.parse import urlparse
 
 import click
@@ -173,15 +177,26 @@ class StreamingOutput(io.BufferedIOBase):
                     pass
 
 
+def _host_active(event):
+    """Return True if a USB host is currently streaming the camera as a UVC webcam."""
+    return bool(event is not None and event.is_set())
+
+
 class StreamingHandler(server.BaseHTTPRequestHandler):
     """A request handler for serving the MJPEG stream."""
 
     frame_buffer = None
+    # threading.Event set while a USB host streams the camera as a UVC webcam.
+    # The HTTP stream yields to it (no dual consumers). None until wired.
+    host_streaming = None
 
     def do_GET(self):  # noqa:N802
         """Serve the MJPEG stream."""
         url = urlparse(self.path)
         if url.path in ('/', '/webcam'):
+            if _host_active(self.host_streaming):
+                self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
+                return
             self.send_response(200)
             self.send_header('Age', 0)
             self.send_header('Cache-Control', 'no-cache, private')
@@ -197,6 +212,10 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                             logging.warning('No frame within timeout, disconnecting %s', self.client_address)
                             break
                         frame = self.frame_buffer.frame
+                    if _host_active(self.host_streaming):
+                        # A USB host just took over the camera — drop the client.
+                        logging.info('USB host took over; disconnecting stream client %s', self.client_address)
+                        break
                     self.wfile.write(b'--FRAME\r\n')
                     self.send_header('Content-Type', 'image/jpeg')
                     self.send_header('Content-Length', len(frame))
@@ -219,6 +238,10 @@ class HttpHandler(server.BaseHTTPRequestHandler):
     # CameraController instance shared across handler threads. None means the
     # control API endpoints respond 503 (camera initialised without controls).
     controller = None
+    # threading.Event set while a USB host streams the camera as a UVC webcam.
+    # While set, the host owns the camera: snapshots and control writes are
+    # refused and the UI greys out (the host drives controls over UVC).
+    host_streaming = None
 
     # The MJPEG hot path lives on a separate StreamingServer (port 8081) and
     # never goes through this handler — so the JSON control endpoints below
@@ -234,7 +257,13 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             self.send_header('Content-Length', len(self.page_bytes))
             self.end_headers()
             self.wfile.write(self.page_bytes)
+        elif url.path == '/api/status':
+            # Cheap endpoint the UI polls to learn when the host owns the camera.
+            self._send_json(200, {'host_active': _host_active(self.host_streaming)})
         elif url.path in ('/picture/1/current/', '/snapshot'):
+            if _host_active(self.host_streaming):
+                self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
+                return
             try:
                 with self.frame_buffer.condition:
                     if not self.frame_buffer.condition.wait(timeout=5):
@@ -258,6 +287,7 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             self._send_json(
                 200,
                 {
+                    'host_active': _host_active(self.host_streaming),
                     'capabilities': self.controller.capabilities(),
                     'state': self.controller.get_state(),
                 },
@@ -270,6 +300,11 @@ class HttpHandler(server.BaseHTTPRequestHandler):
         """Handle control updates, reset, and one-shot autofocus."""
         url = urlparse(self.path)
 
+        if url.path in ('/api/controls', '/api/controls/reset',
+                        '/api/autofocus') and _host_active(self.host_streaming):
+            # The USB host owns the camera while it streams; reject UI writes.
+            self._send_json(409, {'error': 'Camera is controlled by the USB host (UVC)'})
+            return
         if url.path == '/api/controls':
             self._handle_apply_controls()
         elif url.path == '/api/controls/reset':
@@ -585,6 +620,16 @@ def start(
     coordinator.set_controller(controller)
     controller.register_change_listener(coordinator.on_change)
     HttpHandler.controller = controller
+
+    # When a USB host opens the UVC stream it owns the camera: the HTTP stream
+    # and control writes yield to it (the UI greys out with a hint). The pump
+    # toggles this via the coordinator's stream listener.
+    host_streaming = Event()
+    HttpHandler.host_streaming = host_streaming
+    StreamingHandler.host_streaming = host_streaming
+    coordinator.register_stream_listener(
+        lambda active: host_streaming.set() if active else host_streaming.clear(),
+    )
 
     try:
         # Initial pipeline + gadget + pump.
