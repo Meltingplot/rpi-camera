@@ -600,6 +600,14 @@ class UvcGadget(threading.Thread):
             buf.memory = V4L2_MEMORY_MMAP
             buf.index = index
             fcntl.ioctl(self._fd, VIDIOC_QUERYBUF, buf)
+            if index == 0:
+                log.info(
+                    'UVC: QUERYBUF len=%d off=%d sizeof=%d raw=%s',
+                    buf.length,
+                    buf.m.offset,
+                    ctypes.sizeof(V4l2Buffer),
+                    bytes(buf).hex(),
+                )
             mm = mmap.mmap(
                 self._fd,
                 buf.length,
@@ -651,7 +659,14 @@ class UvcGadget(threading.Thread):
             self._dqbuf_errs += 1
             if self._dqbuf_errs <= 3:
                 log.warning('UVC: DQBUF failed: %s', exc)
+            # A wedged DQBUF leaves POLLOUT permanently set, which would
+            # spin this loop at 100% and starve the (single-core) camera
+            # into a watchdog reboot. Stop streaming so the loop idles.
+            if self._dqbuf_errs > 10 and self._streaming:
+                log.error('UVC: too many DQBUF failures; stopping stream to avoid CPU starvation')
+                self._teardown_stream()
             return
+        self._dqbuf_errs = 0
         # Refill the just-consumed buffer with the newest frame and requeue.
         self._queue_buffer(buf.index)
 
