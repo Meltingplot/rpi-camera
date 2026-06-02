@@ -246,7 +246,11 @@ class V4l2EventSubscription(ctypes.Structure):
 
 
 class _V4l2EventUnion(ctypes.Union):
-    _fields_ = [('data', ctypes.c_uint8 * 64)]
+    # The kernel's union has an __s64 member (v4l2_event_ctrl.value64), so it
+    # is 8-byte aligned and lands at offset 8 in v4l2_event (after 4 bytes of
+    # padding past `type`). The _align member forces that same alignment here
+    # so ev.u.data starts where the kernel actually wrote the payload.
+    _fields_ = [('data', ctypes.c_uint8 * 64), ('_align', ctypes.c_uint64)]
 
 
 class V4l2Event(ctypes.Structure):
