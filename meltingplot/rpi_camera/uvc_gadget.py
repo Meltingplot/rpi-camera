@@ -454,7 +454,10 @@ class UvcGadget(threading.Thread):
                 if self._dqevent_fails > 20:
                     log.error('UVC: giving up after repeated DQEVENT failures; pump stopped')
                     return
-            if ready_w:
+            # Re-check _streaming: a STREAMOFF handled just above may have
+            # torn the stream down, and DQBUF on the stopped stream would
+            # raise EINVAL on every disconnect.
+            if ready_w and self._streaming:
                 self._process_frame()
 
     # -- event handling ------------------------------------------------

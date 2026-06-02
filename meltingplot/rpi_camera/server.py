@@ -451,9 +451,10 @@ def _default_resolution(model=None):
     '--framerate',
     type=int,
     envvar='RPI_CAMERA_FRAMERATE',
-    default=10,
+    default=4,
     show_default=True,
-    help='Target frame rate.',
+    help='Target frame rate. Kept low by default because MJPEG capture '
+    'plus the HTTP and USB-UVC fan-out saturates the low-end Pi boards.',
 )
 @click.option(
     '--http-port',
