@@ -102,6 +102,25 @@ USB_TYPE_MASK = 0x60
 USB_TYPE_CLASS = 0x20
 USB_DIR_IN = 0x80
 
+_EVENT_NAMES = {
+    UVC_EVENT_CONNECT: 'CONNECT',
+    UVC_EVENT_DISCONNECT: 'DISCONNECT',
+    UVC_EVENT_STREAMON: 'STREAMON',
+    UVC_EVENT_STREAMOFF: 'STREAMOFF',
+    UVC_EVENT_SETUP: 'SETUP',
+    UVC_EVENT_DATA: 'DATA',
+}
+_REQ_NAMES = {
+    UVC_SET_CUR: 'SET_CUR',
+    UVC_GET_CUR: 'GET_CUR',
+    UVC_GET_MIN: 'GET_MIN',
+    UVC_GET_MAX: 'GET_MAX',
+    UVC_GET_RES: 'GET_RES',
+    UVC_GET_LEN: 'GET_LEN',
+    UVC_GET_INFO: 'GET_INFO',
+    UVC_GET_DEF: 'GET_DEF',
+}
+
 
 # --- ctypes structures (sizes resolved per-ABI at runtime) ------------
 class Timeval(ctypes.Structure):
@@ -388,6 +407,7 @@ class UvcGadget(threading.Thread):
             return
         try:
             self._subscribe_events()
+            log.info('UVC: subscribed to events on %s, entering loop', self._device)
             self._loop()
         except Exception:  # never let the pump take down the process
             log.exception('UVC: pump thread crashed; gadget streaming disabled')
@@ -428,9 +448,11 @@ class UvcGadget(threading.Thread):
         ev = V4l2Event()
         try:
             fcntl.ioctl(self._fd, VIDIOC_DQEVENT, ev)
-        except OSError:
+        except OSError as exc:
+            log.warning('UVC: DQEVENT failed: %s', exc)
             return
 
+        log.info('UVC: event %s', _EVENT_NAMES.get(ev.type, hex(ev.type)))
         if ev.type == UVC_EVENT_SETUP:
             req = UsbCtrlRequest.from_buffer_copy(bytes(ev.u.data)[:ctypes.sizeof(UsbCtrlRequest)])
             self._handle_setup(req)
@@ -447,6 +469,14 @@ class UvcGadget(threading.Thread):
     def _handle_setup(self, req):
         cs = (req.wValue >> 8) & 0xFF  # control selector in the high byte
         is_class = (req.bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS
+        log.info(
+            'UVC: setup bmReqType=0x%02x req=%s cs=%d iface=%d wLength=%d',
+            req.bRequestType,
+            _REQ_NAMES.get(req.bRequest, hex(req.bRequest)),
+            cs,
+            req.wIndex & 0xFF,
+            req.wLength,
+        )
         if not is_class:
             # We only drive the streaming-interface class requests; stall
             # anything else by sending a zero-length response.
@@ -472,6 +502,7 @@ class UvcGadget(threading.Thread):
     def _handle_data(self, data):
         # Payload of a SET_CUR on PROBE or COMMIT — accept and mirror it.
         cs = getattr(self, '_pending_cs', UVC_VS_PROBE_CONTROL)
+        log.info('UVC: data for cs=%d length=%d', cs, data.length)
         length = min(max(0, data.length), ctypes.sizeof(UvcStreamingControl))
         raw = bytes(data.data)[:length]
         ctrl = UvcStreamingControl.from_buffer_copy(
@@ -503,7 +534,9 @@ class UvcGadget(threading.Thread):
             return
         try:
             self._set_format()
+            log.info('UVC: S_FMT ok')
             self._request_buffers(_NUM_BUFFERS)
+            log.info('UVC: REQBUFS got %d buffers', len(self._buffers))
             # Queue every buffer (each is filled with the latest frame).
             for index in range(len(self._buffers)):
                 self._queue_buffer(index)
