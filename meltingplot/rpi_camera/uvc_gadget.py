@@ -124,15 +124,15 @@ _REQ_NAMES = {
 
 # --- ctypes structures (sizes resolved per-ABI at runtime) ------------
 class Timeval(ctypes.Structure):
-    """Mirror of ``struct timeval`` (kernel ABI)."""
+    """Time64 ``struct timeval`` (16 bytes — trixie armhf uses 64-bit time_t)."""
 
-    _fields_ = [('tv_sec', ctypes.c_long), ('tv_usec', ctypes.c_long)]
+    _fields_ = [('tv_sec', ctypes.c_int64), ('tv_usec', ctypes.c_int64)]
 
 
 class Timespec(ctypes.Structure):
-    """Mirror of ``struct timespec`` (kernel ABI)."""
+    """``struct __kernel_timespec`` (time64, 16 bytes on 32- and 64-bit)."""
 
-    _fields_ = [('tv_sec', ctypes.c_long), ('tv_nsec', ctypes.c_long)]
+    _fields_ = [('tv_sec', ctypes.c_int64), ('tv_nsec', ctypes.c_int64)]
 
 
 class V4l2Timecode(ctypes.Structure):
@@ -348,6 +348,7 @@ class UvcGadget(threading.Thread):
         self._buffers = []  # list of mmap objects
         self._probe = self._make_streaming_control()
         self._commit = self._make_streaming_control()
+        self._dqevent_fails = 0
 
     @staticmethod
     def find_device():
@@ -440,6 +441,11 @@ class UvcGadget(threading.Thread):
                 break
             if ready_x:
                 self._handle_event()
+                # ENOTTY on every DQEVENT means our v4l2_event size is wrong
+                # for this kernel; bail rather than spin the CPU forever.
+                if self._dqevent_fails > 20:
+                    log.error('UVC: giving up after repeated DQEVENT failures; pump stopped')
+                    return
             if ready_w:
                 self._process_frame()
 
@@ -449,8 +455,15 @@ class UvcGadget(threading.Thread):
         try:
             fcntl.ioctl(self._fd, VIDIOC_DQEVENT, ev)
         except OSError as exc:
-            log.warning('UVC: DQEVENT failed: %s', exc)
+            self._dqevent_fails += 1
+            if self._dqevent_fails == 1:
+                log.warning(
+                    'UVC: DQEVENT failed (%s); v4l2_event size=%d may be wrong',
+                    exc,
+                    ctypes.sizeof(V4l2Event),
+                )
             return
+        self._dqevent_fails = 0
 
         log.info('UVC: event %s', _EVENT_NAMES.get(ev.type, hex(ev.type)))
         if ev.type == UVC_EVENT_SETUP:
