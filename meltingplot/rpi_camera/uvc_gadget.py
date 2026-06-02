@@ -353,6 +353,9 @@ class UvcGadget(threading.Thread):
         self._probe = self._make_streaming_control()
         self._commit = self._make_streaming_control()
         self._dqevent_fails = 0
+        self._fill_calls = 0
+        self._empty_fills = 0
+        self._dqbuf_errs = 0
 
     @staticmethod
     def find_device():
@@ -550,6 +553,15 @@ class UvcGadget(threading.Thread):
         if self._streaming:
             return
         try:
+            probe = None
+            try:
+                probe = self._get_frame()
+            except Exception:
+                probe = None
+            log.info(
+                'UVC: frame source at streamon: %s',
+                ('%d bytes' % len(probe)) if probe else 'EMPTY/None',
+            )
             self._set_format()
             log.info('UVC: S_FMT ok')
             self._request_buffers(_NUM_BUFFERS)
@@ -601,14 +613,21 @@ class UvcGadget(threading.Thread):
         frame = None
         try:
             frame = self._get_frame()
-        except Exception:
+        except Exception as exc:
+            log.warning('UVC: get_frame raised: %s', exc)
             frame = None
         mm = self._buffers[index]
+        self._fill_calls += 1
         if not frame:
+            self._empty_fills += 1
+            if self._empty_fills <= 3 or self._empty_fills % 300 == 0:
+                log.warning('UVC: no frame to send (empty fill #%d)', self._empty_fills)
             return 0
         size = min(len(frame), mm.size())
         mm.seek(0)
         mm.write(frame[:size])
+        if self._fill_calls <= 3:
+            log.info('UVC: filled buffer %d with %d bytes', index, size)
         return size
 
     def _queue_buffer(self, index):
@@ -628,7 +647,10 @@ class UvcGadget(threading.Thread):
         buf.memory = V4L2_MEMORY_MMAP
         try:
             fcntl.ioctl(self._fd, VIDIOC_DQBUF, buf)
-        except OSError:
+        except OSError as exc:
+            self._dqbuf_errs += 1
+            if self._dqbuf_errs <= 3:
+                log.warning('UVC: DQBUF failed: %s', exc)
             return
         # Refill the just-consumed buffer with the newest frame and requeue.
         self._queue_buffer(buf.index)
