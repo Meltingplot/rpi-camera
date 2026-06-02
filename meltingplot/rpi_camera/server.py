@@ -56,6 +56,7 @@ from picamera2.outputs import FileOutput
 import piexif
 
 from .controls import CameraController
+from .uvc_gadget import UvcGadget
 
 # Fallback HTML for environments where the package data isn't installed
 # (e.g. someone running the source tree directly without `pip install -e .`).
@@ -392,6 +393,18 @@ def _read_board_model():
         return ''
 
 
+def _start_uvc_pump(frame_buffer, width, height, framerate):
+    """Start the UVC gadget pump if an output node is present, else None."""
+    uvc_device = UvcGadget.find_device()
+    if not uvc_device:
+        logging.info('No UVC gadget output node found; UVC disabled')
+        return None
+    logging.info('UVC gadget node: %s', uvc_device)
+    pump = UvcGadget(uvc_device, width, height, framerate, lambda: frame_buffer.frame)
+    pump.start()
+    return pump
+
+
 def _default_resolution(model=None):
     """Pick the default capture resolution for this board.
 
@@ -479,6 +492,14 @@ def _default_resolution(model=None):
     'Default: ~/.config/meltingplot-rpi-camera/controls.json.',
 )
 @click.option(
+    '--enable-uvc/--no-enable-uvc',
+    envvar='RPI_CAMERA_ENABLE_UVC',
+    default=True,
+    show_default=True,
+    help='Feed the MJPEG stream into a USB UVC gadget when one is present. '
+    'No-op on boards/images without the gadget configured.',
+)
+@click.option(
     '--log-level',
     type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
     default='INFO',
@@ -496,6 +517,7 @@ def start(
     watchdog_interval,
     watchdog_grace_period,
     controls_file,
+    enable_uvc,
     log_level,
 ):
     """
@@ -537,7 +559,14 @@ def start(
         ),
     )
     picam2.start_recording(MJPEGEncoder(), FileOutput(frame_buffer))
+    uvc_pump = None
     try:
+        # Mirror the live MJPEG into a USB UVC gadget when one is present.
+        # picamera2 stays the sole camera owner; the pump only reads the
+        # shared frame buffer, so HTTP and UVC run from one capture.
+        if enable_uvc:
+            uvc_pump = _start_uvc_pump(frame_buffer, width, height, framerate)
+
         wanted_controls = {"FrameRate": framerate}
         if autofocus:
             try:
@@ -564,6 +593,8 @@ def start(
 
         asyncio.run(_run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog_grace_period))
     finally:
+        if uvc_pump is not None:
+            uvc_pump.stop()
         picam2.stop_recording()
 
 
