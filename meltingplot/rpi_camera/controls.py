@@ -155,10 +155,23 @@ CURATED_CONTROLS = {
         'label': 'Frame rate (fps)',
         'group': 'capture',
         'min': 1,
-        'max': 120,
+        'max': 30,
         'step': 1,
+        'default': 4,
+    },
+    'Resolution': {
+        'ui_type': 'select',
+        'label': 'Resolution',
+        'group': 'capture',
+        'options': ['640x480', '1280x720', '1920x1080'],
     },
 }
+
+# Controls that change the capture pipeline (and therefore the USB UVC
+# gadget descriptors) rather than a live libcamera setting. They are not
+# passed to ``picam2.set_controls``; instead they are persisted and the
+# registered change listeners reconfigure the camera + gadget.
+RECONFIG_CONTROLS = frozenset({'Resolution', 'FrameRate'})
 
 # Map each enum-valued control to the libcamera enum class that owns its
 # values. Used to translate persisted/JSON string names ("Continuous") to
@@ -214,13 +227,24 @@ class CameraController:
         self._persist_path = persist_path
         self._lock = threading.RLock()
         self._state = {}
+        self._listeners = []
 
         os.makedirs(os.path.dirname(self._persist_path), exist_ok=True)
 
         available = set(picam2.camera_controls.keys())
-        # FrameRate is a virtual control picamera2 maps to FrameDurationLimits;
-        # camera_controls doesn't list it directly, so accept it unconditionally.
-        self._supported = (set(CURATED_CONTROLS.keys()) & available) | {'FrameRate'}
+        # FrameRate/Resolution are virtual (capture-pipeline) controls that
+        # camera_controls doesn't list, so accept them unconditionally.
+        self._supported = (set(CURATED_CONTROLS.keys()) & available) | RECONFIG_CONTROLS
+
+    def register_change_listener(self, fn):
+        """Register ``fn(merged_state, changed_reconfig)`` for reconfig changes.
+
+        Called (outside the lock) whenever a control in
+        :data:`RECONFIG_CONTROLS` (Resolution/FrameRate) is applied, so the
+        server can reconfigure the camera and the USB UVC gadget. Listeners
+        must return quickly; do the heavy work asynchronously.
+        """
+        self._listeners.append(fn)
 
     def capabilities(self):
         """Return curated metadata enriched with per-sensor bounds.
@@ -247,6 +271,36 @@ class CameraController:
         with self._lock:
             return dict(self._state)
 
+    def seed_reconfig_state(self, resolution, framerate):
+        """Record the active Resolution/FrameRate for the UI without applying.
+
+        Called once at startup so the UI shows the current capture settings.
+        Uses ``setdefault`` so a value loaded from the persisted file wins.
+        """
+        with self._lock:
+            self._state.setdefault('Resolution', resolution)
+            self._state.setdefault('FrameRate', framerate)
+
+    def reapply_live(self):
+        """Re-apply persisted live libcamera controls after a reconfigure.
+
+        A ``picam2.configure`` resets every control, so the reconfigure
+        coordinator calls this to restore exposure/white-balance/etc. from
+        the persisted state. Resolution/FrameRate are skipped — they are the
+        reconfigure inputs, not live controls.
+        """
+        with self._lock:
+            live = {
+                k: _to_libcamera(k, v)
+                for k, v in self._state.items() if k not in RECONFIG_CONTROLS and k in self._supported
+            }
+            if not live:
+                return
+            try:
+                self._picam2.set_controls(live)
+            except Exception:
+                log.exception('Failed to re-apply live controls after reconfigure')
+
     def apply(self, partial):
         """Apply a partial control dict to the live camera and persist it.
 
@@ -267,13 +321,31 @@ class CameraController:
         if not filtered:
             return self.get_state()
 
-        translated = {name: _to_libcamera(name, value) for name, value in filtered.items()}
+        # Capture-pipeline controls (Resolution/FrameRate) are persisted and
+        # handed to the reconfig listeners; only the rest are live libcamera
+        # controls applied via set_controls.
+        reconfig = {k: v for k, v in filtered.items() if k in RECONFIG_CONTROLS}
+        live = {k: v for k, v in filtered.items() if k not in RECONFIG_CONTROLS}
 
         with self._lock:
-            self._picam2.set_controls(translated)
+            if live:
+                translated = {name: _to_libcamera(name, value) for name, value in live.items()}
+                self._picam2.set_controls(translated)
             self._state.update(filtered)
             self._save_locked()
-            return dict(self._state)
+            merged = dict(self._state)
+
+        # Fire reconfig listeners outside the lock: reconfiguring the camera
+        # and re-binding the USB gadget can take seconds (the host sees a USB
+        # reconnect), and must not block other control writes.
+        if reconfig:
+            for fn in self._listeners:
+                try:
+                    fn(merged, reconfig)
+                except Exception:
+                    log.exception('Reconfig listener failed for %s', reconfig)
+
+        return merged
 
     def reset(self):
         """Reset every supported control to its default and wipe state.

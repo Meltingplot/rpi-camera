@@ -47,16 +47,14 @@ from urllib.parse import urlparse
 
 import click
 
-from libcamera import Transform, controls
+from libcamera import Transform
 
 from picamera2 import Picamera2
-from picamera2.encoders import MJPEGEncoder
-from picamera2.outputs import FileOutput
 
 import piexif
 
 from .controls import CameraController
-from .uvc_gadget import UvcGadget
+from .reconfig import ReconfigCoordinator
 
 # Fallback HTML for environments where the package data isn't installed
 # (e.g. someone running the source tree directly without `pip install -e .`).
@@ -393,18 +391,6 @@ def _read_board_model():
         return ''
 
 
-def _start_uvc_pump(frame_buffer, width, height, framerate):
-    """Start the UVC gadget pump if an output node is present, else None."""
-    uvc_device = UvcGadget.find_device()
-    if not uvc_device:
-        logging.info('No UVC gadget output node found; UVC disabled')
-        return None
-    logging.info('UVC gadget node: %s', uvc_device)
-    pump = UvcGadget(uvc_device, width, height, framerate, lambda: frame_buffer.frame)
-    pump.start()
-    return pump
-
-
 def _default_resolution(model=None):
     """Pick the default capture resolution for this board.
 
@@ -501,6 +487,14 @@ def _default_resolution(model=None):
     'No-op on boards/images without the gadget configured.',
 )
 @click.option(
+    '--gadget-reconfig-helper',
+    envvar='RPI_CAMERA_GADGET_RECONFIG_HELPER',
+    default='/usr/local/sbin/rpi-cam-gadget-reconfig.sh',
+    show_default=True,
+    help='Privileged helper (run via sudo) that rewrites the UVC gadget '
+    'descriptors and re-binds the UDC on a resolution/fps change.',
+)
+@click.option(
     '--log-level',
     type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
     default='INFO',
@@ -519,6 +513,7 @@ def start(
     watchdog_grace_period,
     controls_file,
     enable_uvc,
+    gadget_reconfig_helper,
     log_level,
 ):
     """
@@ -553,50 +548,42 @@ def start(
         logging.error("Error initializing the camera: %s — is a RPi camera connected?", e)
         raise
 
-    picam2.configure(
-        picam2.create_video_configuration(
-            main={"size": (width, height)},
-            transform=frame_buffer.hw_transform,
-        ),
+    persist_path = controls_file or os.path.join(
+        os.path.expanduser('~'),
+        '.config',
+        'meltingplot-rpi-camera',
+        'controls.json',
     )
-    picam2.start_recording(MJPEGEncoder(), FileOutput(frame_buffer))
-    uvc_pump = None
+    controller = CameraController(picam2, persist_path)
+
+    # The coordinator owns the recording, the UVC gadget descriptors and the
+    # pump, so a UI Resolution/FrameRate change reconfigures camera + gadget
+    # together (picamera2 stays the sole camera owner; the pump only reads the
+    # shared frame buffer, so HTTP and UVC run from one capture).
+    coordinator = ReconfigCoordinator(
+        picam2,
+        frame_buffer,
+        transform=frame_buffer.hw_transform,
+        autofocus=autofocus,
+        enable_uvc=enable_uvc,
+        gadget_helper=gadget_reconfig_helper,
+    )
+    coordinator.set_controller(controller)
+    controller.register_change_listener(coordinator.on_change)
+    HttpHandler.controller = controller
+
     try:
-        # Mirror the live MJPEG into a USB UVC gadget when one is present.
-        # picamera2 stays the sole camera owner; the pump only reads the
-        # shared frame buffer, so HTTP and UVC run from one capture.
-        if enable_uvc:
-            uvc_pump = _start_uvc_pump(frame_buffer, width, height, framerate)
-
-        wanted_controls = {"FrameRate": framerate}
-        if autofocus:
-            try:
-                picam2.set_controls({**wanted_controls, "AfMode": controls.AfModeEnum.Continuous})
-            except Exception as e:
-                # Camera Module v2 and similar have no AF — fall back without it.
-                logging.warning("Autofocus not supported, continuing without: %s", e)
-                picam2.set_controls(wanted_controls)
-        else:
-            picam2.set_controls(wanted_controls)
-
-        # Wire up the live control API. Persisted values (if any) override the
-        # CLI defaults applied above, so a saved exposure/AF setting survives
-        # a watchdog reboot.
-        persist_path = controls_file or os.path.join(
-            os.path.expanduser('~'),
-            '.config',
-            'meltingplot-rpi-camera',
-            'controls.json',
-        )
-        controller = CameraController(picam2, persist_path)
+        # Initial pipeline + gadget + pump.
+        coordinator.bring_up(width, height, framerate)
+        # Show the active capture settings in the UI, then load persisted
+        # controls — a saved Resolution/FrameRate triggers a reconfigure, the
+        # rest are applied live (survives a watchdog reboot).
+        controller.seed_reconfig_state('%dx%d' % (width, height), framerate)
         controller.load_and_apply_persisted()
-        HttpHandler.controller = controller
 
         asyncio.run(_run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog_grace_period))
     finally:
-        if uvc_pump is not None:
-            uvc_pump.stop()
-        picam2.stop_recording()
+        coordinator.stop()
 
 
 def _load_page_bytes(stream_port):
