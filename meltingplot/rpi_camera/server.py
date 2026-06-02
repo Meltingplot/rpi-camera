@@ -382,6 +382,33 @@ async def watchdog(frame_buffer, interval=2, grace_period=30):
         last_count = frame_buffer.frame_counter
 
 
+def _read_board_model():
+    """Return the Raspberry Pi model string, or '' if it can't be read."""
+    try:
+        with open('/proc/device-tree/model', 'rb') as fh:
+            # The device-tree string is NUL-terminated.
+            return fh.read().decode('utf-8', 'replace').rstrip('\x00').strip()
+    except OSError:
+        return ''
+
+
+def _default_resolution(model=None):
+    """Pick the default capture resolution for this board.
+
+    The single-core BCM2835 boards (Pi Zero / Zero W, ARMv6, 1 GHz) cannot
+    sustain 1080p MJPEG alongside the HTTP/UVC fan-out comfortably, so they
+    default to 720p. Every other board defaults to 1080p. An explicit
+    ``--width``/``--height`` (or ``RPI_CAMERA_WIDTH``/``HEIGHT``) overrides
+    this. The Pi Zero **2** W is a quad-core board and is excluded from the
+    720p case.
+    """
+    if model is None:
+        model = _read_board_model()
+    if 'Zero' in model and 'Zero 2' not in model:
+        return 1280, 720
+    return 1920, 1080
+
+
 @click.command()
 @click.option(
     '--rotation',
@@ -391,9 +418,30 @@ async def watchdog(frame_buffer, interval=2, grace_period=30):
     help='Image rotation in degrees. 0/180 are applied by the sensor (free); '
     '90/270 are signalled to the client via EXIF.',
 )
-@click.option('--width', type=int, default=1920, show_default=True, help='Capture width in pixels.')
-@click.option('--height', type=int, default=1080, show_default=True, help='Capture height in pixels.')
-@click.option('--framerate', type=int, default=10, show_default=True, help='Target frame rate.')
+@click.option(
+    '--width',
+    type=int,
+    envvar='RPI_CAMERA_WIDTH',
+    default=None,
+    help='Capture width in pixels. Defaults per board: 1280 on the '
+    'single-core Pi Zero / Zero W, 1920 elsewhere.',
+)
+@click.option(
+    '--height',
+    type=int,
+    envvar='RPI_CAMERA_HEIGHT',
+    default=None,
+    help='Capture height in pixels. Defaults per board: 720 on the '
+    'single-core Pi Zero / Zero W, 1080 elsewhere.',
+)
+@click.option(
+    '--framerate',
+    type=int,
+    envvar='RPI_CAMERA_FRAMERATE',
+    default=10,
+    show_default=True,
+    help='Target frame rate.',
+)
 @click.option(
     '--http-port',
     type=int,
@@ -461,6 +509,15 @@ def start(
         level=log_level.upper(),
         format='%(asctime)s %(levelname)s %(name)s: %(message)s',
     )
+
+    # Resolve the per-board default capture resolution when the operator
+    # has not pinned --width/--height (or the RPI_CAMERA_WIDTH/HEIGHT env).
+    default_width, default_height = _default_resolution()
+    if width is None:
+        width = default_width
+    if height is None:
+        height = default_height
+    logging.info('Capture resolution: %dx%d @ %d fps', width, height, framerate)
 
     frame_buffer = StreamingOutput(rotation=int(rotation))
     HttpHandler.frame_buffer = frame_buffer
