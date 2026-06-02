@@ -631,7 +631,9 @@ class UvcGadget(threading.Thread):
             if self._empty_fills <= 3 or self._empty_fills % 300 == 0:
                 log.warning('UVC: no frame to send (empty fill #%d)', self._empty_fills)
             return 0
-        size = min(len(frame), mm.size())
+        # len(mm) is the mapped length; mm.size() is the backing file size,
+        # which is 0 for a V4L2 device fd — using it here yielded 0-byte frames.
+        size = min(len(frame), len(mm))
         mm.seek(0)
         mm.write(frame[:size])
         if self._fill_calls <= 3:
@@ -646,7 +648,7 @@ class UvcGadget(threading.Thread):
         # bytesused must reflect the JPEG length we wrote.
         frame_len = self._fill_buffer(index)
         buf.bytesused = frame_len
-        buf.length = self._buffers[index].size()
+        buf.length = len(self._buffers[index])
         fcntl.ioctl(self._fd, VIDIOC_QBUF, buf)
 
     def _process_frame(self):
