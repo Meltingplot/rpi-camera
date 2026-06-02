@@ -22,6 +22,7 @@ the pump thread without touching the HTTP/MJPEG server.
 """
 
 import ctypes
+import errno
 import fcntl
 import logging
 import mmap
@@ -323,7 +324,7 @@ VIDIOC_DQEVENT = _ior('V', 89, V4l2Event)
 VIDIOC_SUBSCRIBE_EVENT = _iow('V', 90, V4l2EventSubscription)
 UVCIOC_SEND_RESPONSE = _iow('U', 1, UvcRequestData)
 
-_NUM_BUFFERS = 4
+_NUM_BUFFERS = 6
 
 
 class UvcGadget(threading.Thread):
@@ -472,7 +473,7 @@ class UvcGadget(threading.Thread):
             return
         self._dqevent_fails = 0
 
-        log.info('UVC: event %s', _EVENT_NAMES.get(ev.type, hex(ev.type)))
+        log.debug('UVC: event %s', _EVENT_NAMES.get(ev.type, hex(ev.type)))
         if ev.type == UVC_EVENT_SETUP:
             req = UsbCtrlRequest.from_buffer_copy(bytes(ev.u.data)[:ctypes.sizeof(UsbCtrlRequest)])
             self._handle_setup(req)
@@ -489,7 +490,7 @@ class UvcGadget(threading.Thread):
     def _handle_setup(self, req):
         cs = (req.wValue >> 8) & 0xFF  # control selector in the high byte
         is_class = (req.bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS
-        log.info(
+        log.debug(
             'UVC: setup bmReqType=0x%02x req=%s cs=%d iface=%d wLength=%d',
             req.bRequestType,
             _REQ_NAMES.get(req.bRequest, hex(req.bRequest)),
@@ -522,7 +523,7 @@ class UvcGadget(threading.Thread):
     def _handle_data(self, data):
         # Payload of a SET_CUR on PROBE or COMMIT — accept and mirror it.
         cs = getattr(self, '_pending_cs', UVC_VS_PROBE_CONTROL)
-        log.info('UVC: data for cs=%d length=%d', cs, data.length)
+        log.debug('UVC: data for cs=%d length=%d', cs, data.length)
         length = min(max(0, data.length), ctypes.sizeof(UvcStreamingControl))
         raw = bytes(data.data)[:length]
         ctrl = UvcStreamingControl.from_buffer_copy(
@@ -563,9 +564,9 @@ class UvcGadget(threading.Thread):
                 ('%d bytes' % len(probe)) if probe else 'EMPTY/None',
             )
             self._set_format()
-            log.info('UVC: S_FMT ok')
+            log.debug('UVC: S_FMT ok')
             self._request_buffers(_NUM_BUFFERS)
-            log.info('UVC: REQBUFS got %d buffers', len(self._buffers))
+            log.debug('UVC: REQBUFS got %d buffers', len(self._buffers))
             # Queue every buffer (each is filled with the latest frame).
             for index in range(len(self._buffers)):
                 self._queue_buffer(index)
@@ -601,7 +602,7 @@ class UvcGadget(threading.Thread):
             buf.index = index
             fcntl.ioctl(self._fd, VIDIOC_QUERYBUF, buf)
             if index == 0:
-                log.info(
+                log.debug(
                     'UVC: QUERYBUF len=%d off=%d sizeof=%d raw=%s',
                     buf.length,
                     buf.m.offset,
@@ -637,7 +638,7 @@ class UvcGadget(threading.Thread):
         mm.seek(0)
         mm.write(frame[:size])
         if self._fill_calls <= 3:
-            log.info('UVC: filled buffer %d with %d bytes', index, size)
+            log.debug('UVC: filled buffer %d with %d bytes', index, size)
         return size
 
     def _queue_buffer(self, index):
@@ -652,25 +653,30 @@ class UvcGadget(threading.Thread):
         fcntl.ioctl(self._fd, VIDIOC_QBUF, buf)
 
     def _process_frame(self):
-        buf = V4l2Buffer()
-        buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
-        buf.memory = V4L2_MEMORY_MMAP
-        try:
-            fcntl.ioctl(self._fd, VIDIOC_DQBUF, buf)
-        except OSError as exc:
-            self._dqbuf_errs += 1
-            if self._dqbuf_errs <= 3:
-                log.warning('UVC: DQBUF failed: %s', exc)
-            # A wedged DQBUF leaves POLLOUT permanently set, which would
-            # spin this loop at 100% and starve the (single-core) camera
-            # into a watchdog reboot. Stop streaming so the loop idles.
-            if self._dqbuf_errs > 10 and self._streaming:
-                log.error('UVC: too many DQBUF failures; stopping stream to avoid CPU starvation')
-                self._teardown_stream()
-            return
-        self._dqbuf_errs = 0
-        # Refill the just-consumed buffer with the newest frame and requeue.
-        self._queue_buffer(buf.index)
+        # Drain every buffer the gadget has finished with this wake-up and
+        # requeue each with the latest frame, so the queue stays full and
+        # the host underruns (-ENODATA) as little as the single core allows.
+        while True:
+            buf = V4l2Buffer()
+            buf.type = V4L2_BUF_TYPE_VIDEO_OUTPUT
+            buf.memory = V4L2_MEMORY_MMAP
+            try:
+                fcntl.ioctl(self._fd, VIDIOC_DQBUF, buf)
+            except OSError as exc:
+                if exc.errno == errno.EAGAIN:
+                    return  # no more ready buffers — normal
+                self._dqbuf_errs += 1
+                if self._dqbuf_errs <= 3:
+                    log.warning('UVC: DQBUF failed: %s', exc)
+                # A wedged DQBUF leaves POLLOUT permanently set, which would
+                # spin this loop at 100% and starve the (single-core) camera
+                # into a watchdog reboot. Stop streaming so the loop idles.
+                if self._dqbuf_errs > 10 and self._streaming:
+                    log.error('UVC: too many DQBUF failures; stopping stream to avoid CPU starvation')
+                    self._teardown_stream()
+                return
+            self._dqbuf_errs = 0
+            self._queue_buffer(buf.index)
 
     def _teardown_stream(self):
         if self._fd < 0:
