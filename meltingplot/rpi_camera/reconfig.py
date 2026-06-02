@@ -208,11 +208,13 @@ class ReconfigCoordinator:
         log.info('UVC gadget node: %s', device)
         # The host picks the resolution/fps from the advertised set; the pump
         # calls back here to reconfigure the camera and to flag when the host
-        # is streaming. It reads frames from the shared frame buffer.
+        # is streaming. The controller lets the pump map the host's UVC
+        # VideoControl requests (brightness/exposure/...) to libcamera.
         self._pump = UvcGadget(
             device,
             self._frame_buffer,
             on_host_format=self._on_host_format,
             on_stream_state=self._on_stream_state,
+            controller=self._controller,
         )
         self._pump.start()

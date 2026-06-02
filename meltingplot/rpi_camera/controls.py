@@ -271,6 +271,20 @@ class CameraController:
         with self._lock:
             return dict(self._state)
 
+    def bounds(self, name):
+        """Return the sensor's ``(min, max, default)`` for a control, or None.
+
+        Used by the UVC control bridge to map the host's integer wire values
+        onto the actual sensor range. ``Resolution``/``FrameRate`` are virtual
+        and not present in ``camera_controls``.
+        """
+        return self._picam2.camera_controls.get(name)
+
+    def current(self, name, fallback=None):
+        """Return the currently applied value for a control, or ``fallback``."""
+        with self._lock:
+            return self._state.get(name, fallback)
+
     def seed_reconfig_state(self, resolution, framerate):
         """Record the active Resolution/FrameRate for the UI without applying.
 

@@ -37,6 +37,8 @@ import select
 import struct
 import threading
 
+from .uvc_controls import UvcControlBridge
+
 log = logging.getLogger(__name__)
 
 # --- Static gadget envelope -------------------------------------------
@@ -427,15 +429,19 @@ class UvcGadget(threading.Thread):
         on_stream_state: optional ``callback(active: bool)`` invoked when the
             host opens (True) / closes (False) the UVC stream, so the HTTP
             server can yield the camera while it is bound as a webcam.
+        controller: optional :class:`CameraController`; when given, the host's
+            UVC VideoControl requests (brightness/exposure/focus/...) are mapped
+            to libcamera controls via a :class:`UvcControlBridge`.
     """
 
-    def __init__(self, device, frame_buffer, on_host_format=None, on_stream_state=None):
+    def __init__(self, device, frame_buffer, on_host_format=None, on_stream_state=None, controller=None):
         """Bind the pump to a gadget node, the frame buffer and coordinator callbacks."""
         super().__init__(name='uvc-gadget', daemon=True)
         self._device = device
         self._frame_buffer = frame_buffer
         self._on_host_format = on_host_format
         self._on_stream_state = on_stream_state
+        self._bridge = UvcControlBridge(controller) if controller is not None else None
         # eventfd the frame buffer pokes on every new frame, so the select()
         # loop can block on "new frame OR V4L2 event" with no timeout/poll.
         self._wake_fd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
@@ -454,6 +460,8 @@ class UvcGadget(threading.Thread):
         self._last_counter = -1  # frame_counter last pushed to the gadget
         self._probe = self._control_for(self._frame_index, self._interval)
         self._commit = self._control_for(self._frame_index, self._interval)
+        self._pending_cs = UVC_VS_PROBE_CONTROL  # selector of an in-flight VS SET_CUR
+        self._pending_vc = None  # (unit, selector) of an in-flight VC SET_CUR
         self._dqevent_fails = 0
         self._empty_fills = 0
         self._dqbuf_errs = 0
@@ -639,28 +647,36 @@ class UvcGadget(threading.Thread):
 
     def _handle_setup(self, req):
         cs = (req.wValue >> 8) & 0xFF  # control selector in the high byte
+        entity = (req.wIndex >> 8) & 0xFF  # unit/terminal id (0 == interface)
         is_class = (req.bRequestType & USB_TYPE_MASK) == USB_TYPE_CLASS
         log.debug(
-            'UVC: setup bmReqType=0x%02x req=%s cs=%d iface=%d wLength=%d',
+            'UVC: setup bmReqType=0x%02x req=%s entity=%d cs=%d wLength=%d',
             req.bRequestType,
             _REQ_NAMES.get(req.bRequest, hex(req.bRequest)),
+            entity,
             cs,
-            req.wIndex & 0xFF,
             req.wLength,
         )
         if not is_class:
-            # We only drive the streaming-interface class requests; stall
-            # anything else by sending a zero-length response.
+            # Only class requests are ours; stall anything else.
             self._send_response(b'')
             return
+        if entity != 0:
+            # A VideoControl unit/terminal request (brightness, exposure, ...).
+            self._handle_vc_setup(req, entity, cs)
+            return
+        self._handle_vs_setup(req, cs)
+
+    def _handle_vs_setup(self, req, cs):
+        # VideoStreaming interface: PROBE/COMMIT resolution+fps negotiation.
         if req.bRequest == UVC_SET_CUR:
-            # Accept the data stage (length = control size); the payload
-            # arrives next as a UVC_EVENT_DATA.
+            # Accept the data stage; the payload arrives as a UVC_EVENT_DATA.
             self._pending_cs = cs
+            self._pending_vc = None
             self._send_response(bytes(ctypes.sizeof(UvcStreamingControl)))
             return
-        # GET_* requests on PROBE/COMMIT: report the negotiable range so the
-        # host can enumerate resolutions, and the current/default selection.
+        # GET_* requests: report the negotiable range so the host can enumerate
+        # resolutions, and the current/default selection.
         if cs in (UVC_VS_PROBE_CONTROL, UVC_VS_COMMIT_CONTROL):
             if req.bRequest == UVC_GET_LEN:
                 self._send_response(struct.pack('<H', ctypes.sizeof(UvcStreamingControl)))
@@ -679,11 +695,32 @@ class UvcGadget(threading.Thread):
         else:
             self._send_response(b'')
 
+    def _handle_vc_setup(self, req, entity, cs):
+        # VideoControl unit/terminal request -> the camera-control bridge.
+        if self._bridge is None or not self._bridge.handles(entity, cs):
+            self._send_response(b'')  # not advertised — stall
+            return
+        if req.bRequest == UVC_SET_CUR:
+            # Accept the data stage; payload arrives as a UVC_EVENT_DATA.
+            self._pending_vc = (entity, cs)
+            self._pending_cs = None
+            self._send_response(bytes(self._bridge.length(entity, cs)))
+            return
+        resp = self._bridge.get(entity, cs, req.bRequest)
+        self._send_response(resp if resp is not None else b'')
+
     def _handle_data(self, data):
-        # Payload of a SET_CUR on PROBE or COMMIT — read the host's chosen
-        # frame index + interval, clamp to what we advertise, and echo back a
-        # consistent control.
-        cs = getattr(self, '_pending_cs', UVC_VS_PROBE_CONTROL)
+        # Payload of a SET_CUR. Route to the control bridge if it was a
+        # VideoControl request, otherwise interpret it as PROBE/COMMIT.
+        if self._pending_vc is not None:
+            entity, cs = self._pending_vc
+            self._pending_vc = None
+            raw = bytes(data.data)[:max(0, min(data.length, len(data.data)))]
+            self._bridge.set_cur(entity, cs, raw)
+            return
+        # PROBE/COMMIT: read the host's chosen frame index + interval, clamp to
+        # what we advertise, and echo back a consistent control.
+        cs = self._pending_cs
         length = min(max(0, data.length), ctypes.sizeof(UvcStreamingControl))
         raw = bytes(data.data)[:length]
         req = UvcStreamingControl.from_buffer_copy(
