@@ -112,9 +112,20 @@ def _fps_from_interval(interval):
 
 
 def _clamp_interval(interval):
-    """Clamp a requested frame interval to the advertised [fastest, slowest]."""
-    lo, hi = FRAME_INTERVALS[0], FRAME_INTERVALS[-1]
-    return max(lo, min(hi, interval)) if interval > 0 else lo
+    """Snap a requested frame interval to the nearest advertised value.
+
+    FRAME_INTERVALS is ascending (fastest first). We return the first listed
+    interval >= the request (rounding the fps down to a supported rate), or the
+    slowest if the request is below every listed rate. UVC requires the device
+    to echo back a value it actually advertised, not an arbitrary in-between
+    interval, so this snaps instead of merely clamping the range.
+    """
+    if interval <= 0:
+        return FRAME_INTERVALS[0]
+    for iv in FRAME_INTERVALS:
+        if iv >= interval:
+            return iv
+    return FRAME_INTERVALS[-1]
 
 
 # --- ioctl number construction (asm-generic _IOC, used by arm) ---------
@@ -573,7 +584,16 @@ class UvcGadget(threading.Thread):
         ):
             sub = V4l2EventSubscription()
             sub.type = ev
-            fcntl.ioctl(self._fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+            # Tolerate a single unsupported event rather than killing the whole
+            # pump: subscribe each independently and warn-and-continue on error.
+            try:
+                fcntl.ioctl(self._fd, VIDIOC_SUBSCRIBE_EVENT, sub)
+            except OSError as exc:
+                log.warning(
+                    'UVC: could not subscribe event %s (%s); continuing',
+                    _EVENT_NAMES.get(ev, hex(ev)),
+                    exc,
+                )
 
     def _loop(self):
         fb = self._frame_buffer
@@ -693,8 +713,13 @@ class UvcGadget(threading.Thread):
                 self._send_response(bytes(self._control_for(len(self._frames), FRAME_INTERVALS[-1])))
             elif req.bRequest == UVC_GET_DEF:
                 self._send_response(bytes(self._control_for(_default_frame_index(self._frames), FRAME_INTERVALS[0])))
-            else:  # GET_CUR / GET_RES
-                self._send_response(bytes(self._probe))
+            elif req.bRequest == UVC_GET_CUR:
+                # Current selection for the addressed control: the host reads the
+                # PROBE control while negotiating and the COMMIT control after.
+                ctrl = self._commit if cs == UVC_VS_COMMIT_CONTROL else self._probe
+                self._send_response(bytes(ctrl))
+            else:  # GET_RES — step size; none of our control fields are steppable.
+                self._send_response(bytes(UvcStreamingControl()))
         else:
             self._send_response(b'')
 
