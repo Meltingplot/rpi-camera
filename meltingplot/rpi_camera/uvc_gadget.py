@@ -53,10 +53,13 @@ MAX_FPS = 30
 # 30/15/10/5/4/2/1 fps. MUST match the dwFrameInterval list written by
 # rpi-cam-gadget-setup.sh.
 FRAME_INTERVALS = (333333, 666666, 1000000, 2000000, 2500000, 5000000, 10000000)
-# Mirrors streaming_maxpacket in rpi-cam-gadget-setup.sh (high-bandwidth
-# iso: 2048 B/microframe). Reported to the host in PROBE/COMMIT so it sizes
-# its payload requests to match the endpoint.
-_ISO_MAXPACKET = 2048
+# MUST mirror streaming_maxpacket in rpi-cam-gadget-setup.sh. Reported to the
+# host in PROBE/COMMIT (dwMaxPayloadTransferSize) so it paces its isoc payload
+# requests to what the endpoint can actually carry per microframe. Capped at
+# 1024 (single-transaction iso): the Pi's dwc2 UDC has no high-bandwidth iso,
+# so a larger value here makes the host reserve bandwidth the gadget can never
+# deliver -> underruns and stalled/intermittent frames.
+_ISO_MAXPACKET = 1024
 
 
 def _read_board_model():
