@@ -852,7 +852,10 @@ class UvcGadget(threading.Thread):
         mm = self._buffers[index]
         size = min(len(frame), len(mm))
         mm.seek(0)
-        mm.write(frame[:size])
+        # memoryview slice is zero-copy; mm.write then does the single copy
+        # into the mapping. Slicing `frame[:size]` would allocate and copy the
+        # whole JPEG first — wasteful per-frame at video rates.
+        mm.write(memoryview(frame)[:size])
         return size
 
     def _push_frame(self, frame):
