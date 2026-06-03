@@ -13,6 +13,11 @@ WorkingDirectory=/home/pi
 User=pi
 Group=pi
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+# /run/rpi-camera holds the watchdog's restart marker. Owned by User=/Group=,
+# preserved across `systemctl restart` (so the two-stage watchdog can tell a
+# recovered restart from a still-wedged one) but wiped on reboot.
+RuntimeDirectory=rpi-camera
+RuntimeDirectoryPreserve=restart
 
 [Install]
 WantedBy=multi-user.target

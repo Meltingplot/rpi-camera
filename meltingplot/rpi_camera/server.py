@@ -45,6 +45,7 @@ import os
 import signal
 import socketserver
 import subprocess
+import time
 from http import server
 from threading import Condition, Event, Semaphore
 from urllib.parse import urlparse
@@ -424,20 +425,99 @@ class StreamingServer(socketserver.ThreadingMixIn, server.HTTPServer):
             self._client_sem.release()
 
 
-async def watchdog(frame_buffer, interval=2, grace_period=30):
-    """Monitor the frame buffer and reboot if no new frames are received within the interval.
+# Self-issued service restarts are recorded here so the *next* process (the
+# restart kills this one) can tell a recovered pipeline from one that is still
+# wedged. Lives under the unit's RuntimeDirectory (/run, tmpfs): it survives a
+# `systemctl restart` (RuntimeDirectoryPreserve=restart) but is wiped on reboot,
+# so a hard reboot always re-arms stage 1.
+_STALL_MARKER = '/run/rpi-camera/frame-stall'
 
-    The grace_period absorbs camera initialization delay at startup; without it a
-    slow-to-start camera triggers an immediate reboot loop.
+
+def _read_restart_marker():
+    """Return the time.time() of the last self-issued restart, or 0.0 if none."""
+    try:
+        with open(_STALL_MARKER) as fh:
+            return float(fh.read().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _clear_restart_marker():
+    """Drop the restart marker (no-op if absent)."""
+    try:
+        os.remove(_STALL_MARKER)
+    except OSError:
+        pass
+
+
+def _escalate_stall(now, restart_window):
+    """Act on a confirmed frame stall; return the action taken.
+
+    Stage 1 ('restart'): no restart issued within ``restart_window`` seconds, so
+    restart rpi-camera.service to recover a wedged libcamera pipeline without a
+    full boot, recording the attempt in the /run marker.
+    Stage 2 ('reboot'): a restart was already issued within the window and frames
+    still have not resumed, so reboot.
+
+    If the marker cannot be written, stage 2 could never fire, so we reboot
+    rather than risk an unbounded restart loop on a permanently wedged pipeline.
+    """
+    restarted_at = _read_restart_marker()
+    if restarted_at and (now - restarted_at) < restart_window:
+        logging.error(
+            "Watchdog: no new frames %ds after restarting rpi-camera.service; rebooting",
+            int(now - restarted_at),
+        )
+        _clear_restart_marker()
+        subprocess.run(["sudo", "reboot"], check=False)
+        return 'reboot'
+
+    try:
+        with open(_STALL_MARKER, 'w') as fh:
+            fh.write('%f' % now)
+    except OSError as exc:
+        logging.error("Watchdog: cannot persist restart marker (%s); rebooting", exc)
+        subprocess.run(["sudo", "reboot"], check=False)
+        return 'reboot'
+
+    logging.warning("Watchdog: frame stall detected; restarting rpi-camera.service")
+    subprocess.run(["sudo", "systemctl", "restart", "rpi-camera.service"], check=False)
+    return 'restart'
+
+
+async def watchdog(frame_buffer, interval=2, grace_period=30, stall_limit=5, restart_window=300):
+    """Two-stage frame-stall watchdog.
+
+    After ``grace_period`` (which absorbs camera init at startup), sample
+    ``frame_counter`` every ``interval`` seconds. When no new frame arrives for
+    ``stall_limit`` consecutive samples, escalate via :func:`_escalate_stall`:
+    first restart the service, and only reboot if a restart within the last
+    ``restart_window`` seconds failed to restore frames. This is deliberately
+    more forgiving than an immediate reboot — a transient hiccup no longer costs
+    a full boot cycle.
     """
     await asyncio.sleep(grace_period)
     last_count = frame_buffer.frame_counter
+    stalls = 0
+    # A pre-restart instance may have left a marker; clear it once frames prove
+    # healthy. Tracked locally so the healthy path isn't a remove() every tick.
+    marker_maybe = _read_restart_marker() > 0
     while True:
         await asyncio.sleep(interval)
-        if frame_buffer.frame_counter == last_count:
-            logging.warning("No new frames received in the last interval! Rebooting...")
-            subprocess.run(["sudo", "reboot"], check=False)
-        last_count = frame_buffer.frame_counter
+        count = frame_buffer.frame_counter
+        if count != last_count:
+            last_count = count
+            stalls = 0
+            if marker_maybe:
+                _clear_restart_marker()
+                marker_maybe = False
+            continue
+        stalls += 1
+        if stalls < stall_limit:
+            continue
+        if _escalate_stall(time.time(), restart_window) == 'restart':
+            marker_maybe = True
+        stalls = 0
 
 
 def _read_board_model():
@@ -530,6 +610,22 @@ def _default_resolution(model=None):
     help='Seconds the watchdog waits at startup before enforcing the frame-counter check.',
 )
 @click.option(
+    '--watchdog-stall-limit',
+    type=int,
+    default=5,
+    show_default=True,
+    help='Consecutive watchdog checks with no new frame before the watchdog acts. '
+    'With the default 2s interval, 5 means ~10s of frozen video before a restart.',
+)
+@click.option(
+    '--watchdog-restart-window',
+    type=int,
+    default=300,
+    show_default=True,
+    help='If a watchdog-triggered service restart does not restore frames within '
+    'this many seconds, the watchdog escalates to a full reboot.',
+)
+@click.option(
     '--controls-file',
     type=click.Path(dir_okay=False),
     default=None,
@@ -562,6 +658,8 @@ def start(
     autofocus,
     watchdog_interval,
     watchdog_grace_period,
+    watchdog_stall_limit,
+    watchdog_restart_window,
     controls_file,
     enable_uvc,
     log_level,
@@ -640,7 +738,17 @@ def start(
         controller.seed_reconfig_state('%dx%d' % (width, height), framerate)
         controller.load_and_apply_persisted()
 
-        asyncio.run(_run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog_grace_period))
+        asyncio.run(
+            _run(
+                frame_buffer,
+                http_port,
+                stream_port,
+                watchdog_interval,
+                watchdog_grace_period,
+                watchdog_stall_limit,
+                watchdog_restart_window,
+            ),
+        )
     finally:
         coordinator.stop()
 
@@ -657,7 +765,15 @@ def _load_page_bytes(stream_port):
     return html.replace('__STREAM_PORT__', str(stream_port)).encode('utf-8')
 
 
-async def _run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog_grace_period):
+async def _run(
+    frame_buffer,
+    http_port,
+    stream_port,
+    watchdog_interval,
+    watchdog_grace_period,
+    watchdog_stall_limit=5,
+    watchdog_restart_window=300,
+):
     """Run both HTTP servers and the watchdog; exit when any of them stops."""
     loop = asyncio.get_running_loop()
     http = StreamingServer(('', http_port), HttpHandler)
@@ -673,7 +789,13 @@ async def _run(frame_buffer, http_port, stream_port, watchdog_interval, watchdog
 
     server_futures = [loop.run_in_executor(None, s.serve_forever) for s in servers]
     watchdog_task = asyncio.create_task(
-        watchdog(frame_buffer, interval=watchdog_interval, grace_period=watchdog_grace_period),
+        watchdog(
+            frame_buffer,
+            interval=watchdog_interval,
+            grace_period=watchdog_grace_period,
+            stall_limit=watchdog_stall_limit,
+            restart_window=watchdog_restart_window,
+        ),
     )
     stop_task = asyncio.create_task(stop_event.wait())
     pending = (*server_futures, watchdog_task, stop_task)
