@@ -18,6 +18,7 @@ instead of blocking for the seconds a pipeline reconfigure takes.
 """
 
 import logging
+import os
 import queue
 import threading
 
@@ -34,6 +35,12 @@ log = logging.getLogger(__name__)
 # duration limits are microseconds: (min = 30 fps, max = 1 fps). Without a
 # wide range here picamera2 picks a sensor mode that clamps low frame rates.
 FRAME_DURATION_LIMITS = (33333, 1000000)
+
+# Touched when a USB host opens the UVC stream. The image's gadget mode-switch
+# (rpi-cam-gadget-mode.sh) reads this to decide whether to keep the device in
+# UVC mode or fall back to NCM networking. Lives in the systemd RuntimeDirectory
+# (wiped each boot); override for tests via RPI_CAMERA_UVC_ACTIVE_FLAG.
+UVC_ACTIVE_FLAG = os.environ.get('RPI_CAMERA_UVC_ACTIVE_FLAG', '/run/rpi-camera/uvc-active')
 
 
 def parse_resolution(value, fallback):
@@ -112,11 +119,28 @@ class ReconfigCoordinator:
         """Toggle host ownership and notify listeners when the host opens/closes the stream."""
         self._host_streaming = active
         log.info('USB host UVC stream %s', 'started' if active else 'stopped')
+        if active:
+            self._flag_uvc_active()
         if self._stream_listener is not None:
             try:
                 self._stream_listener(active)
             except Exception:
                 log.exception('stream listener failed')
+
+    @staticmethod
+    def _flag_uvc_active():
+        """Record that a host opened the UVC stream (see UVC_ACTIVE_FLAG).
+
+        Best-effort: the boot-time gadget mode-switch reads this to keep the
+        device in UVC mode instead of falling back to NCM. A failure here only
+        means a genuinely-used webcam might still flip to NCM, so it is logged
+        and ignored rather than disrupting streaming.
+        """
+        try:
+            with open(UVC_ACTIVE_FLAG, 'w') as fh:
+                fh.write('1')
+        except OSError as exc:
+            log.debug('could not write UVC-active flag %s: %s', UVC_ACTIVE_FLAG, exc)
 
     def stop(self):
         """Stop the pump and recording (called on server shutdown)."""
