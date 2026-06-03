@@ -578,12 +578,22 @@ class UvcGadget(threading.Thread):
     def _loop(self):
         fb = self._frame_buffer
         while not self._stop.is_set():
-            # One blocking wait on both sources: V4L2 events arrive on the
-            # exception set; a new camera frame (or stop()) pokes the eventfd
-            # on the read set. No timeout, no poll — the loop only wakes when
-            # there is actually something to do.
+            # Wait on three sources, no timeout/poll:
+            #   - exception set: a V4L2 event (STREAMON/OFF, setup, ...);
+            #   - read set: a new camera frame or stop() poking the eventfd;
+            #   - write set (only while streaming): the output node ready to
+            #     dequeue a finished buffer (POLLOUT), our cue to top the queue
+            #     back up.
+            # That last source is what keeps the isochronous IN endpoint
+            # continuously fed. If the queue is allowed to drain between camera
+            # frames the endpoint starves, and dwc2 answers every host IN token
+            # on the empty endpoint with an "incomplete iso IN" (IISOIXFR)
+            # interrupt -- a storm that pins a CPU core. Re-sending the current
+            # frame until a new one arrives (standard UVC webcam behaviour)
+            # keeps the endpoint busy with clean transfers instead.
+            wset = [self._fd] if (self._streaming and fb.frame is not None) else []
             try:
-                ready_r, _, ready_x = select.select([self._wake_fd], [], [self._fd])
+                ready_r, ready_w, ready_x = select.select([self._wake_fd], wset, [self._fd])
             except OSError:
                 break
             if ready_x:
@@ -600,16 +610,25 @@ class UvcGadget(threading.Thread):
             if not self._streaming:
                 continue
             # Reclaim every buffer the gadget has finished transmitting, then
-            # push the current frame — but only once per *new* camera frame.
-            # Between frames the queue is left to drain and the gadget sends
-            # zero-length iso packets (normal webcam underrun), so we neither
-            # burn CPU re-copying nor re-send duplicate frames over USB.
+            # keep the output queue full with the latest frame so the endpoint
+            # never underruns. `fb.frame` is always replaced (never mutated),
+            # so re-reading it here picks up new camera frames for free.
             self._reclaim_buffers()
-            counter = fb.frame_counter
             frame = fb.frame
-            if frame and counter != self._last_counter:
-                if self._push_frame(frame):
-                    self._last_counter = counter
+            if frame:
+                self._fill_queue(frame)
+                self._last_counter = fb.frame_counter
+
+    def _fill_queue(self, frame):
+        """Queue ``frame`` into every free buffer so the iso endpoint stays fed.
+
+        Re-sending the latest frame until the camera produces a new one is
+        standard UVC webcam behaviour and keeps dwc2 out of the IISOIXFR
+        (incomplete-iso-IN) interrupt storm a starved endpoint triggers.
+        """
+        while self._free:
+            if not self._push_frame(frame):
+                break
 
     def _drain_wake(self):
         """Clear the wake eventfd (one read resets its accumulated counter)."""
@@ -788,11 +807,12 @@ class UvcGadget(threading.Thread):
             log.debug('UVC: S_FMT ok')
             self._request_buffers(_NUM_BUFFERS)
             log.debug('UVC: REQBUFS got %d buffers', len(self._buffers))
-            # Prime a single buffer with the current frame so the host gets an
-            # immediate first image; the rest stay free for the pacing loop,
-            # which queues one buffer per new camera frame.
+            # Prime the whole queue with the current frame so the endpoint is
+            # fed from the first IN token; the loop then keeps it topped up on
+            # every POLLOUT (see _loop). An empty queue at streamon is the
+            # IISOIXFR-storm condition we are specifically avoiding.
             if frame:
-                self._push_frame(frame)
+                self._fill_queue(frame)
                 self._last_counter = self._frame_buffer.frame_counter
             on = ctypes.c_int(V4L2_BUF_TYPE_VIDEO_OUTPUT)
             fcntl.ioctl(self._fd, VIDIOC_STREAMON, on)
