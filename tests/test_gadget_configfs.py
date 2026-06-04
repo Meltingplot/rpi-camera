@@ -49,10 +49,12 @@ def test_read_streaming(tmp_path):
         _write(d + '/wWidth', str(w))
         _write(d + '/wHeight', str(h))
         _write(d + '/dwFrameInterval', ivs)
-    frames, intervals, maxpacket = gc.read_streaming(base)
+        _write(d + '/dwMaxVideoFrameBufferSize', str(w * h * 2))
+    frames, intervals, frame_sizes, maxpacket = gc.read_streaming(base)
     assert maxpacket == 2048
-    assert frames == [(640, 480), (1280, 720)]              # sorted by zero-padded name
+    assert frames == [(640, 480), (1280, 720)]  # sorted by zero-padded name
     assert intervals == [[333333, 416667, 500000], [333333]]
+    assert frame_sizes == [640 * 480 * 2, 1280 * 720 * 2]  # dwMaxVideoFrameBufferSize
 
 
 def test_read_streaming_no_frames_raises(tmp_path):
@@ -80,17 +82,17 @@ def test_read_controls_parses_hex_and_defaults_ids(tmp_path):
 def test_snap_interval():
     """_snap_interval rounds a request up to an advertised interval, else slowest."""
     ivs = [333333, 666666, 1000000]  # 30 / 15 / 10 fps, ascending
-    assert _snap_interval(0, ivs) == 333333          # <=0 -> fastest
-    assert _snap_interval(333333, ivs) == 333333     # exact match
-    assert _snap_interval(800000, ivs) == 1000000    # in-between -> snap up to supported
+    assert _snap_interval(0, ivs) == 333333  # <=0 -> fastest
+    assert _snap_interval(333333, ivs) == 333333  # exact match
+    assert _snap_interval(800000, ivs) == 1000000  # in-between -> snap up to supported
     assert _snap_interval(99999999, ivs) == 1000000  # slower than slowest -> slowest
 
 
 def test_bridge_validation_matches_setup_script(tmp_path, monkeypatch, caplog):
     """The bmControls the setup script writes match the bridge -> no STALL error."""
     base = str(tmp_path / 'uvc.usb0')
-    _camera_terminal(base, '0x2a 0x00 0x02')     # CT: D1,D3,D5,D17
-    _processing_unit(base, '0x1b 0x12 0x00')     # PU: D0,D1,D3,D4,D9,D12
+    _camera_terminal(base, '0x2a 0x00 0x02')  # CT: D1,D3,D5,D17
+    _processing_unit(base, '0x1b 0x12 0x00')  # PU: D0,D1,D3,D4,D9,D12
     monkeypatch.setattr(gc, 'find_uvc_function', lambda: base)
     with caplog.at_level(logging.WARNING):
         UvcControlBridge(mock.MagicMock())

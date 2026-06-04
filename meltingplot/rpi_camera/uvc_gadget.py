@@ -460,15 +460,17 @@ class UvcGadget(threading.Thread):
         # eventfd the frame buffer pokes on every new frame, so the select()
         # loop can block on "new frame OR V4L2 event" with no timeout/poll.
         self._wake_fd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        # Frames, per-frame intervals and iso maxpacket come from configfs (the
-        # gadget the kernel actually advertised), never hardcoded here.
-        self._frames, self._frame_intervals, self._iso_maxpacket = self._load_descriptors()
+        # Frames, per-frame intervals, per-frame max buffer size and iso
+        # maxpacket all come from configfs (the gadget the kernel actually
+        # advertised), never hardcoded here.
+        self._frames, self._frame_intervals, self._frame_sizes, self._iso_maxpacket = self._load_descriptors()
         self._frame_index = _default_frame_index(self._frames)  # 1-based bFrameIndex
         self._interval = self._frame_intervals[self._frame_index - 1][0]  # default frame, fastest
         self._width, self._height = self._frames[self._frame_index - 1]
-        # Buffers are sized to the *committed* frame at STREAMON; 1 byte/pixel
-        # is a safe MJPEG ceiling (~3-5x the largest realistic frame).
-        self._max_frame = self._width * self._height
+        # V4L2 output buffers are sized to the committed frame's advertised
+        # dwMaxVideoFrameBufferSize at STREAMON (so the device can hold any frame
+        # up to what it told the host).
+        self._max_frame = self._frame_sizes[self._frame_index - 1]
         self._fd = -1
         self._stop = threading.Event()
         self._streaming = False
@@ -495,20 +497,22 @@ class UvcGadget(threading.Thread):
         base = gadget_configfs.find_uvc_function()
         if base is not None:
             try:
-                frames, intervals, maxpacket = gadget_configfs.read_streaming(base)
+                frames, intervals, frame_sizes, maxpacket = gadget_configfs.read_streaming(base)
                 log.info(
                     'UVC: descriptors from configfs: %d frames, maxpacket=%d',
                     len(frames),
                     maxpacket,
                 )
-                return frames, intervals, maxpacket
+                return frames, intervals, frame_sizes, maxpacket
             except (OSError, ValueError) as exc:
                 log.warning('UVC: configfs read failed (%s); using built-in defaults', exc)
         else:
             log.warning('UVC: no configfs UVC function found; using built-in defaults')
         frames = gadget_frames()
         intervals = [list(FRAME_INTERVALS) for _ in frames]
-        return frames, intervals, _ISO_MAXPACKET
+        # 1 byte/pixel MJPEG ceiling, matching the historical buffer sizing.
+        frame_sizes = [w * h for (w, h) in frames]
+        return frames, intervals, frame_sizes, _ISO_MAXPACKET
 
     @staticmethod
     def find_device():
@@ -546,11 +550,11 @@ class UvcGadget(threading.Thread):
         width, height = self._frames[frame_index - 1]
         ctrl = UvcStreamingControl()
         ctrl.bmHint = 1
-        ctrl.bFormatIndex = 1  # single MJPEG format
+        ctrl.bFormatIndex = 1  # the gadget advertises a single MJPEG format -> index 1
         ctrl.bFrameIndex = frame_index
         ctrl.dwFrameInterval = _snap_interval(interval, self._frame_intervals[frame_index - 1])
-        # 1 byte/pixel ceiling for the selected frame (matches buffer sizing).
-        ctrl.dwMaxVideoFrameSize = width * height
+        # Must equal the frame descriptor's dwMaxVideoFrameBufferSize (configfs).
+        ctrl.dwMaxVideoFrameSize = self._frame_sizes[frame_index - 1]
         # Match the iso endpoint (streaming_maxpacket, read from configfs) so the
         # host sizes its payload requests correctly, and advertise the 48 MHz UVC
         # clock the gadget uses for presentation timestamps.
@@ -834,8 +838,10 @@ class UvcGadget(threading.Thread):
         if self._streaming:
             return
         try:
-            # Size buffers to the host-committed frame (set in _handle_data).
-            self._max_frame = self._width * self._height
+            # Size buffers to the committed frame's advertised max buffer size
+            # (dwMaxVideoFrameBufferSize from configfs), matching what we told
+            # the host in dwMaxVideoFrameSize. _frame_index is set in _handle_data.
+            self._max_frame = self._frame_sizes[self._frame_index - 1]
             frame = self._frame_buffer.frame
             log.info(
                 'UVC: frame source at streamon: %s',

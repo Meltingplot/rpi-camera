@@ -43,19 +43,21 @@ def _read_int(path):
 
 
 def read_streaming(base):
-    """Return ``(frames, intervals, maxpacket)`` for the UVC function at ``base``.
+    """Return ``(frames, intervals, frame_sizes, maxpacket)`` for ``base``.
 
-    * ``frames``    – ``[(w, h), ...]`` ordered by ``bFrameIndex`` (the kernel
+    * ``frames``      – ``[(w, h), ...]`` ordered by ``bFrameIndex`` (the kernel
       orders frames by configfs dir name, which the setup script zero-pads).
-    * ``intervals`` – ``[[ns, ...], ...]`` parallel to ``frames``, each ascending
-      (fastest first).
-    * ``maxpacket`` – ``streaming_maxpacket`` (int).
+    * ``intervals``   – ``[[ns, ...], ...]`` parallel to ``frames``, ascending.
+    * ``frame_sizes`` – ``[dwMaxVideoFrameBufferSize, ...]`` parallel to
+      ``frames``; the per-frame buffer ceiling the host allocates, which the
+      PROBE/COMMIT ``dwMaxVideoFrameSize`` must echo.
+    * ``maxpacket``   – ``streaming_maxpacket`` (int).
 
     Raises ``OSError``/``ValueError`` if the layout can't be read so the caller
     can fall back.
     """
     maxpacket = _read_int(os.path.join(base, 'streaming_maxpacket'))
-    frames, intervals = [], []
+    frames, intervals, frame_sizes = [], [], []
     # streaming/<format>/<instance>/<WxH>/ — only the frame dirs carry wWidth.
     for frame_dir in sorted(glob.glob(os.path.join(base, 'streaming', '*', '*', '*'))):
         wpath = os.path.join(frame_dir, 'wWidth')
@@ -66,9 +68,10 @@ def read_streaming(base):
         ivs = sorted(int(tok) for tok in _read_text(os.path.join(frame_dir, 'dwFrameInterval')).split())
         frames.append((width, height))
         intervals.append(ivs)
+        frame_sizes.append(_read_int(os.path.join(frame_dir, 'dwMaxVideoFrameBufferSize')))
     if not frames:
         raise ValueError('no UVC frame descriptors found under %s' % base)
-    return frames, intervals, maxpacket
+    return frames, intervals, frame_sizes, maxpacket
 
 
 def _parse_bmcontrols(path):
