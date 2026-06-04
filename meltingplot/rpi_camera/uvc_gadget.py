@@ -85,30 +85,68 @@ def _read_board_model():
         return ''
 
 
+# Shared per-board frame set, owned by the Pi image (pi-cam-gen) and read by
+# BOTH the gadget setup script and us — the single source of truth for capture
+# resolutions, so the USB UVC gadget and this web UI can never drift. Kept on
+# disk (not configfs) because the UVC function is off by default on the image.
+_FRAMES_CONF = '/etc/rpi-camera/frames.conf'
+
+
+def _parse_frame_specs(rest):
+    """Parse ``WxH:fps,...|WxH:fps,...`` into ``[(w, h), ...]`` (sizes only)."""
+    frames = []
+    for spec in rest.split('|'):
+        wxh = spec.split(':', 1)[0].strip()
+        if 'x' not in wxh:
+            continue
+        w, h = wxh.split('x', 1)
+        try:
+            frames.append((int(w), int(h)))
+        except ValueError:
+            continue
+    return frames
+
+
+def _parse_frames_conf(model, path=_FRAMES_CONF):
+    """Return ``[(w, h), ...]`` for ``model`` from the shared frames.conf, or None.
+
+    Format: ``<key>|WxH:fps,...|WxH:fps,...``. The first line whose ``key``
+    ('*' = any) is a substring of ``model`` wins. Only the resolution set is
+    used here (fps is the gadget's concern). None if absent/unreadable/unmatched.
+    """
+    try:
+        with open(path) as fh:
+            lines = fh.readlines()
+    except OSError:
+        return None
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        key, _, rest = line.partition('|')
+        if key != '*' and key not in model:
+            continue
+        frames = _parse_frame_specs(rest)
+        if frames:
+            return frames
+    return None
+
+
 def gadget_frames(model=None):
     """Ordered list of advertised MJPEG frame sizes ``[(w, h), ...]`` for this board.
 
-    The 1-based index into this list IS the UVC ``bFrameIndex`` the host
-    negotiates, so ``rpi-cam-gadget-setup.sh`` MUST create the configfs frames
-    in this exact (ascending) order for the indices to line up. The largest
-    entry is bounded per board to what the hardware can sensibly stream:
-
-    * single-core Pi Zero / Zero W -> up to 1280x720  (1080p too slow over UVC)
-    * Pi Zero 2 W                  -> up to 2304x1296 (IMX708 binned, ~3MP)
-    * everything else (Pi 4/5/...) -> up to 4608x2592 (IMX708 full sensor)
-
-    The host (UVC consumer) picks one of these; the pump then drives picamera2
-    to the chosen size, so no descriptor rewrite / USB re-enumeration occurs.
+    Read from the shared :data:`_FRAMES_CONF` (the same file the gadget setup
+    script uses), so the web UI's capture-resolution list and the USB UVC
+    gadget always agree. The 1-based index into this list IS the UVC
+    ``bFrameIndex``. Falls back to a generic default only when the config is
+    absent (dev / non-image installs); there the per-board sizing doesn't apply.
     """
     if model is None:
         model = _read_board_model()
-    if 'Zero 2' in model:
-        return [(640, 480), (1280, 720), (1920, 1080), (2304, 1296)]
-    if 'Zero' in model:
-        # Single-core Zero / Zero W: UVC capped at 720p (1080p is too slow over
-        # USB on one ARMv6 core). The HTTP/web stream is not limited by this.
-        return [(640, 480), (1280, 720)]
-    return [(640, 480), (1280, 720), (1920, 1080), (2304, 1296), (4608, 2592)]
+    frames = _parse_frames_conf(model)
+    if frames:
+        return frames
+    return [(640, 480), (1280, 720), (1920, 1080)]
 
 
 def _default_frame_index(frames):
