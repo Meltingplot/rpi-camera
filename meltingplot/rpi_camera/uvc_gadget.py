@@ -463,7 +463,8 @@ class UvcGadget(threading.Thread):
         # Frames, per-frame intervals, per-frame max buffer size and iso
         # maxpacket all come from configfs (the gadget the kernel actually
         # advertised), never hardcoded here.
-        self._frames, self._frame_intervals, self._frame_sizes, self._iso_maxpacket = self._load_descriptors()
+        (self._frames, self._frame_intervals, self._frame_sizes, self._iso_maxpacket,
+         self._format_index) = self._load_descriptors()
         self._frame_index = _default_frame_index(self._frames)  # 1-based bFrameIndex
         self._interval = self._frame_intervals[self._frame_index - 1][0]  # default frame, fastest
         self._width, self._height = self._frames[self._frame_index - 1]
@@ -498,12 +499,13 @@ class UvcGadget(threading.Thread):
         if base is not None:
             try:
                 frames, intervals, frame_sizes, maxpacket = gadget_configfs.read_streaming(base)
+                format_index = gadget_configfs.mjpeg_format_index(base)
                 log.info(
                     'UVC: descriptors from configfs: %d frames, maxpacket=%d',
                     len(frames),
                     maxpacket,
                 )
-                return frames, intervals, frame_sizes, maxpacket
+                return frames, intervals, frame_sizes, maxpacket, format_index
             except (OSError, ValueError) as exc:
                 log.warning('UVC: configfs read failed (%s); using built-in defaults', exc)
         else:
@@ -512,7 +514,7 @@ class UvcGadget(threading.Thread):
         intervals = [list(FRAME_INTERVALS) for _ in frames]
         # 1 byte/pixel MJPEG ceiling, matching the historical buffer sizing.
         frame_sizes = [w * h for (w, h) in frames]
-        return frames, intervals, frame_sizes, _ISO_MAXPACKET
+        return frames, intervals, frame_sizes, _ISO_MAXPACKET, 1
 
     @staticmethod
     def find_device():
@@ -550,7 +552,7 @@ class UvcGadget(threading.Thread):
         width, height = self._frames[frame_index - 1]
         ctrl = UvcStreamingControl()
         ctrl.bmHint = 1
-        ctrl.bFormatIndex = 1  # the gadget advertises a single MJPEG format -> index 1
+        ctrl.bFormatIndex = self._format_index  # MJPEG format index, from configfs
         ctrl.bFrameIndex = frame_index
         ctrl.dwFrameInterval = _snap_interval(interval, self._frame_intervals[frame_index - 1])
         # Must equal the frame descriptor's dwMaxVideoFrameBufferSize (configfs).

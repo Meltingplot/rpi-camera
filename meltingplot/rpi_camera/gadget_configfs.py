@@ -58,8 +58,10 @@ def read_streaming(base):
     """
     maxpacket = _read_int(os.path.join(base, 'streaming_maxpacket'))
     frames, intervals, frame_sizes = [], [], []
-    # streaming/<format>/<instance>/<WxH>/ — only the frame dirs carry wWidth.
-    for frame_dir in sorted(glob.glob(os.path.join(base, 'streaming', '*', '*', '*'))):
+    # streaming/mjpeg/<instance>/<WxH>/ — the pump is MJPEG-only, so read only
+    # the MJPEG format's frames (a second format, if any, is validated/flagged
+    # separately by mjpeg_format_index). Only frame dirs carry wWidth.
+    for frame_dir in sorted(glob.glob(os.path.join(base, 'streaming', 'mjpeg', '*', '*'))):
         wpath = os.path.join(frame_dir, 'wWidth')
         if not os.path.exists(wpath):
             continue
@@ -72,6 +74,29 @@ def read_streaming(base):
     if not frames:
         raise ValueError('no UVC frame descriptors found under %s' % base)
     return frames, intervals, frame_sizes, maxpacket
+
+
+def mjpeg_format_index(base):
+    """Return the 1-based ``bFormatIndex`` of the MJPEG streaming format.
+
+    The pump is MJPEG-only and the setup script advertises a single MJPEG format
+    (index 1). This reads the streaming formats present in configfs and validates
+    that assumption: on any deviation (no MJPEG format, or additional formats
+    alongside it) it logs an error and still returns 1, because the kernel does
+    not expose an arbitrary assigned index to derive and the pump could not feed
+    a non-MJPEG format anyway.
+    """
+    formats = set()
+    for path in glob.glob(os.path.join(base, 'streaming', '*', '*', '*')):
+        if os.path.exists(os.path.join(path, 'wWidth')):
+            formats.add(path.split(os.sep)[-3])  # streaming/<format>/<instance>/<WxH>
+    if sorted(formats) != ['mjpeg']:
+        log.error(
+            'UVC: expected a single MJPEG streaming format; configfs advertises %s. '
+            'The pump is MJPEG-only and assumes bFormatIndex=1 — fix the gadget setup.',
+            formats or 'none',
+        )
+    return 1
 
 
 def _parse_bmcontrols(path):

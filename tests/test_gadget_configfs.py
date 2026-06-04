@@ -111,3 +111,26 @@ def test_bridge_validation_flags_advertised_but_unhandled(tmp_path, monkeypatch,
         UvcControlBridge(mock.MagicMock())
     stalls = [r.getMessage() for r in caplog.records if 'STALL' in r.getMessage()]
     assert stalls and any('0x6' in m for m in stalls), stalls
+
+
+def test_mjpeg_format_index_single_is_clean(tmp_path, caplog):
+    """A single MJPEG format is bFormatIndex 1 and logs no error."""
+    base = str(tmp_path / 'uvc.usb0')
+    d = base + '/streaming/mjpeg/m/0640x0480'
+    _write(d + '/wWidth', '640')
+    _write(d + '/wHeight', '480')
+    with caplog.at_level(logging.ERROR):
+        assert gc.mjpeg_format_index(base) == 1
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_mjpeg_format_index_flags_extra_format(tmp_path, caplog):
+    """An extra non-MJPEG format logs an error (the pump is MJPEG-only)."""
+    base = str(tmp_path / 'uvc.usb0')
+    for fmt in ('mjpeg/m', 'uncompressed/u'):
+        d = '%s/streaming/%s/0640x0480' % (base, fmt)
+        _write(d + '/wWidth', '640')
+        _write(d + '/wHeight', '480')
+    with caplog.at_level(logging.ERROR):
+        assert gc.mjpeg_format_index(base) == 1
+    assert [r for r in caplog.records if r.levelno >= logging.ERROR]
