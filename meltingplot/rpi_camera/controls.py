@@ -165,13 +165,21 @@ CURATED_CONTROLS = {
         'group': 'capture',
         'options': ['640x480', '1280x720', '1920x1080'],
     },
+    'Rotation': {
+        'ui_type': 'select',
+        'label': 'Rotation',
+        'group': 'capture',
+        'options': ['0', '90', '180', '270'],
+    },
 }
 
 # Controls that change the capture pipeline (and therefore the USB UVC
 # gadget descriptors) rather than a live libcamera setting. They are not
 # passed to ``picam2.set_controls``; instead they are persisted and the
-# registered change listeners reconfigure the camera + gadget.
-RECONFIG_CONTROLS = frozenset({'Resolution', 'FrameRate'})
+# registered change listeners reconfigure the camera + gadget. Rotation is
+# here too: 0/180 are sensor hflip+vflip (a configure()-time Transform) and
+# 90/270 set a JPEG EXIF tag, so neither is a live libcamera control.
+RECONFIG_CONTROLS = frozenset({'Resolution', 'FrameRate', 'Rotation'})
 
 # Map each enum-valued control to the libcamera enum class that owns its
 # values. Used to translate persisted/JSON string names ("Continuous") to
@@ -285,8 +293,8 @@ class CameraController:
         with self._lock:
             return self._state.get(name, fallback)
 
-    def seed_reconfig_state(self, resolution, framerate):
-        """Record the active Resolution/FrameRate for the UI without applying.
+    def seed_reconfig_state(self, resolution, framerate, rotation=None):
+        """Record the active Resolution/FrameRate/Rotation for the UI without applying.
 
         Called once at startup so the UI shows the current capture settings.
         Uses ``setdefault`` so a value loaded from the persisted file wins.
@@ -294,6 +302,8 @@ class CameraController:
         with self._lock:
             self._state.setdefault('Resolution', resolution)
             self._state.setdefault('FrameRate', framerate)
+            if rotation is not None:
+                self._state.setdefault('Rotation', str(int(rotation)))
 
     def reapply_live(self):
         """Re-apply persisted live libcamera controls after a reconfigure.

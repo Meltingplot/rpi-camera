@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Coordinate camera reconfiguration on resolution/fps changes.
+"""Coordinate camera reconfiguration on resolution/fps/rotation changes.
 
-Frame rate is a live libcamera control; resolution is not — changing it
-means re-configuring the Picamera2 pipeline (stop/start recording). This
-module owns that sequence so a UI change to either value is applied safely.
+Frame rate is a live libcamera control; resolution and rotation are not —
+changing them means re-configuring the Picamera2 pipeline (stop/start
+recording, since rotation is applied as a configure()-time Transform). This
+module owns that sequence so a UI change to any of them is applied safely.
 
 The USB UVC gadget needs **no** reconfiguration here: its configfs
 descriptors are provisioned once at boot for the worst case the UI allows
@@ -56,11 +57,10 @@ class ReconfigCoordinator:
     changes are ignored.
     """
 
-    def __init__(self, picam2, frame_buffer, *, transform, autofocus, enable_uvc):
+    def __init__(self, picam2, frame_buffer, *, autofocus, enable_uvc):
         """Bind dependencies and start the reconfigure worker thread."""
         self._picam2 = picam2
         self._frame_buffer = frame_buffer
-        self._transform = transform
         self._autofocus = autofocus
         self._enable_uvc = enable_uvc
         self._controller = None
@@ -90,23 +90,37 @@ class ReconfigCoordinator:
             self._reconfigure(width, height, framerate, force=True)
 
     def on_change(self, merged_state, changed):
-        """Enqueue a Resolution/FrameRate change for the worker (returns at once)."""
+        """Enqueue a Resolution/FrameRate/Rotation change for the worker (returns at once)."""
         if self._host_streaming:
-            # The USB host owns resolution/fps while it streams; ignore the UI.
-            log.info('Ignoring UI Resolution/FrameRate change while USB host is streaming')
+            # The USB host owns the camera while it streams; ignore the UI.
+            log.info('Ignoring UI Resolution/FrameRate/Rotation change while USB host is streaming')
             return
+        # Rotation changes the libcamera Transform (0/180) and/or the JPEG EXIF
+        # tag (90/270). The EXIF tag updates live via the setter; the Transform
+        # only takes at configure() time, so force a reconfigure when it changes.
+        rotate_changed = 'Rotation' in changed
+        if rotate_changed:
+            try:
+                new_rotation = int(merged_state.get('Rotation'))
+                if new_rotation == self._frame_buffer.rotation:
+                    rotate_changed = False  # already at this rotation (e.g. seeded default)
+                else:
+                    self._frame_buffer.rotation = new_rotation
+            except (ValueError, TypeError) as exc:
+                log.warning('Ignoring invalid Rotation %r: %s', merged_state.get('Rotation'), exc)
+                rotate_changed = False
         width, height = parse_resolution(
             merged_state.get('Resolution'),
             (self._width or 1280, self._height or 720),
         )
         fps = int(merged_state.get('FrameRate', self._fps or 4))
-        self._queue.put((width, height, fps))
+        self._queue.put((width, height, fps, rotate_changed))
 
     # -- UVC pump callbacks (run on the pump thread) -------------------
     def _on_host_format(self, width, height, fps):
         """Reconfigure the camera to the format the USB host just COMMITted."""
         log.info('USB host selected %dx%d @ %d fps', width, height, fps)
-        self._queue.put((width, height, fps))
+        self._queue.put((width, height, fps, False))
 
     def _on_stream_state(self, active):
         """Toggle host ownership and notify listeners when the host opens/closes the stream."""
@@ -135,16 +149,20 @@ class ReconfigCoordinator:
     def _worker_loop(self):
         while True:
             item = self._queue.get()
-            # Coalesce: only the most recent request matters.
+            force = item[3]
+            # Coalesce: only the most recent target matters, but keep force set
+            # if ANY coalesced request needs it (e.g. a rotation change whose
+            # resolution/fps are unchanged would otherwise be skipped).
             while not self._queue.empty():
                 try:
                     item = self._queue.get_nowait()
+                    force = force or item[3]
                 except queue.Empty:
                     break
-            width, height, fps = item
+            width, height, fps = item[0], item[1], item[2]
             try:
                 with self._lock:
-                    self._reconfigure(width, height, fps, force=False)
+                    self._reconfigure(width, height, fps, force=force)
             except Exception:
                 log.exception('Camera/UVC reconfigure to %dx%d@%d failed', width, height, fps)
 
@@ -162,7 +180,9 @@ class ReconfigCoordinator:
             self._picam2.configure(
                 self._picam2.create_video_configuration(
                     main={'size': (width, height)},
-                    transform=self._transform,
+                    # Read fresh so a web-UI rotation change takes effect (the
+                    # transform only applies at configure() time).
+                    transform=self._frame_buffer.hw_transform,
                     controls={'FrameDurationLimits': FRAME_DURATION_LIMITS},
                 ),
             )

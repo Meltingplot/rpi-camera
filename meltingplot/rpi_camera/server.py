@@ -105,23 +105,40 @@ class StreamingOutput(io.BufferedIOBase):
         Raises:
             ValueError: If the rotation value is not one of [0, 90, 180, 270].
         """
-        if rotation not in (0, 90, 180, 270):
-            raise ValueError("Invalid rotation value")
-
         self.frame = None
         self.condition = Condition()
         self.frame_counter = 0
-        self.rotation = rotation
         # eventfds to poke on every new frame, so a select()-based consumer
         # (the UVC pump) can wait on "new frame" without polling. Guarded by
         # ``condition``; see add_wake_fd / write.
         self._wake_fds = []
+        self._rotation = 0
+        self._jpeg_app1 = None
+        # Validate + build the EXIF tag via the setter.
+        self.rotation = rotation
 
-        # EXIF Orientation tag — only needed for rotations the sensor can't do.
-        # See http://sylvana.net/jpegcrop/exif_orientation.html
-        orientation = {90: 6, 270: 8}.get(rotation)
+    @property
+    def rotation(self):
+        """Current output rotation in degrees: one of 0, 90, 180, 270."""
+        return self._rotation
+
+    @rotation.setter
+    def rotation(self, value):
+        """Set the rotation and (re)build the EXIF Orientation tag.
+
+        0°/180° are applied by the sensor (see :attr:`hw_transform`) so need no
+        EXIF tag; 90°/270° cannot be done in the sensor and are offloaded to the
+        client via an EXIF Orientation tag (see
+        http://sylvana.net/jpegcrop/exif_orientation.html). Runtime-settable so
+        the reconfigure coordinator can change orientation from the web UI; the
+        rebuild happens under ``condition`` so ``write`` never sees a torn tag.
+        """
+        value = int(value)
+        if value not in (0, 90, 180, 270):
+            raise ValueError("Invalid rotation value")
+        orientation = {90: 6, 270: 8}.get(value)
         if orientation is None:
-            self._jpeg_app1 = None
+            app1 = None
         else:
             exif_data = piexif.dump({
                 "0th": {
@@ -129,16 +146,19 @@ class StreamingOutput(io.BufferedIOBase):
                 },
             })
             jpeg_app_len = len(exif_data) + 2
-            self._jpeg_app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
+            app1 = b"\xff\xe1" + (jpeg_app_len).to_bytes(2, byteorder="big") + exif_data
+        with self.condition:
+            self._rotation = value
+            self._jpeg_app1 = app1
 
     @property
     def hw_transform(self):
         """Sensor-readout Transform applied for free by libcamera.
 
         180° = hflip + vflip is a sensor-register flip on IMX219/477/708;
-        90°/270° fall back to the EXIF tag set in ``__init__``.
+        90°/270° fall back to the EXIF tag set by the ``rotation`` setter.
         """
-        flip = self.rotation == 180
+        flip = self._rotation == 180
         return Transform(hflip=flip, vflip=flip)
 
     def add_wake_fd(self, fd):
@@ -721,7 +741,6 @@ def start(
     coordinator = ReconfigCoordinator(
         picam2,
         frame_buffer,
-        transform=frame_buffer.hw_transform,
         autofocus=autofocus,
         enable_uvc=enable_uvc,
     )
@@ -745,7 +764,7 @@ def start(
         # Show the active capture settings in the UI, then load persisted
         # controls — a saved Resolution/FrameRate triggers a reconfigure, the
         # rest are applied live (survives a watchdog reboot).
-        controller.seed_reconfig_state('%dx%d' % (width, height), framerate)
+        controller.seed_reconfig_state('%dx%d' % (width, height), framerate, rotation=frame_buffer.rotation)
         controller.load_and_apply_persisted()
 
         asyncio.run(
