@@ -549,14 +549,19 @@ class UvcGadget(threading.Thread):
     def find_device():
         """Return the gadget's UVC output node, or None.
 
-        The Pi camera capture nodes report ``V4L2_CAP_VIDEO_CAPTURE``; the
-        UVC gadget side is the one reporting ``V4L2_CAP_VIDEO_OUTPUT``. Scan
-        ``/dev/video*`` and return the first output-capable node.
+        The UVC gadget node is the only one whose ``VIDIOC_QUERYCAP`` driver
+        string is ``g_uvc`` (f_uvc fills it in ``uvc_v4l2_querycap``). The Pi
+        camera-pipeline M2M nodes (``bcm2835-isp``, ``bcm2835-codec``,
+        ``unicam``) all also report ``V4L2_CAP_VIDEO_OUTPUT``, so matching on
+        that capability alone grabs an ISP/codec node instead. Match the
+        driver name and require the output cap; fall back to the first
+        output-capable node only if no ``g_uvc`` node is present, logging it.
         """
         try:
             nodes = sorted(n for n in os.listdir('/dev') if n.startswith('video') and n[5:].isdigit())
         except OSError:
             return None
+        fallback = None
         for name in nodes:
             path = '/dev/' + name
             fd = -1
@@ -565,14 +570,25 @@ class UvcGadget(threading.Thread):
                 cap = V4l2Capability()
                 fcntl.ioctl(fd, VIDIOC_QUERYCAP, cap)
                 caps = cap.device_caps if (cap.capabilities & V4L2_CAP_DEVICE_CAPS) else cap.capabilities
-                if caps & V4L2_CAP_VIDEO_OUTPUT:
+                if not (caps & V4L2_CAP_VIDEO_OUTPUT):
+                    continue
+                driver = bytes(cap.driver).split(b'\x00', 1)[0].decode('ascii', 'replace')
+                if driver == 'g_uvc':
+                    log.info('UVC gadget node: %s (driver=%s)', path, driver)
                     return path
+                if fallback is None:
+                    fallback = path
             except OSError:
                 continue
             finally:
                 if fd >= 0:
                     os.close(fd)
-        return None
+        if fallback is not None:
+            log.warning(
+                'no g_uvc gadget node found; UVC function not bound? falling back to %s',
+                fallback,
+            )
+        return fallback
 
     # -- control negotiation ------------------------------------------
     def _control_for(self, frame_index, interval):
