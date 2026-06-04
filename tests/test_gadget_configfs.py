@@ -113,6 +113,14 @@ def test_bridge_validation_flags_advertised_but_unhandled(tmp_path, monkeypatch,
     assert stalls and any('0x6' in m for m in stalls), stalls
 
 
+def test_read_clock_frequency(tmp_path):
+    """read_clock_frequency returns the VC header dwClockFrequency, else None."""
+    base = str(tmp_path / 'uvc.usb0')
+    assert gc.read_clock_frequency(base) is None  # nothing configured yet
+    _write(base + '/control/header/h/dwClockFrequency', '48000000\n')
+    assert gc.read_clock_frequency(base) == 48000000
+
+
 def test_mjpeg_format_index_single_is_clean(tmp_path, caplog):
     """A single MJPEG format is bFormatIndex 1 and logs no error."""
     base = str(tmp_path / 'uvc.usb0')

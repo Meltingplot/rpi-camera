@@ -36,6 +36,7 @@ import os
 import select
 import struct
 import threading
+from collections import namedtuple
 
 from . import gadget_configfs
 from .uvc_controls import UvcControlBridge
@@ -61,6 +62,16 @@ FRAME_INTERVALS = (333333, 666666, 1000000, 2000000, 2500000, 5000000, 10000000)
 # dwMaxPayloadTransferSize fallback. >1024 needs high-bandwidth iso, which the
 # Pi's dwc2 UDC lacks; the real value comes from configfs streaming_maxpacket.
 _ISO_MAXPACKET = 1024
+# dwClockFrequency fallback (Hz) if the VC header doesn't expose one.
+_CLOCK_FREQUENCY = 48_000_000
+
+# The streaming descriptors the pump reads back from configfs (the gadget the
+# kernel actually advertises). Each field has a built-in fallback for running
+# outside the gadget image.
+_GadgetDescriptors = namedtuple(
+    '_GadgetDescriptors',
+    'frames intervals frame_sizes maxpacket format_index clock_freq',
+)
 
 
 def _read_board_model():
@@ -460,11 +471,16 @@ class UvcGadget(threading.Thread):
         # eventfd the frame buffer pokes on every new frame, so the select()
         # loop can block on "new frame OR V4L2 event" with no timeout/poll.
         self._wake_fd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        # Frames, per-frame intervals, per-frame max buffer size and iso
-        # maxpacket all come from configfs (the gadget the kernel actually
+        # Frames, intervals, per-frame buffer size, iso maxpacket, format index
+        # and clock all come from configfs (the gadget the kernel actually
         # advertised), never hardcoded here.
-        (self._frames, self._frame_intervals, self._frame_sizes, self._iso_maxpacket,
-         self._format_index) = self._load_descriptors()
+        d = self._load_descriptors()
+        self._frames = d.frames
+        self._frame_intervals = d.intervals
+        self._frame_sizes = d.frame_sizes
+        self._iso_maxpacket = d.maxpacket
+        self._format_index = d.format_index
+        self._clock_freq = d.clock_freq
         self._frame_index = _default_frame_index(self._frames)  # 1-based bFrameIndex
         self._interval = self._frame_intervals[self._frame_index - 1][0]  # default frame, fastest
         self._width, self._height = self._frames[self._frame_index - 1]
@@ -499,22 +515,35 @@ class UvcGadget(threading.Thread):
         if base is not None:
             try:
                 frames, intervals, frame_sizes, maxpacket = gadget_configfs.read_streaming(base)
-                format_index = gadget_configfs.mjpeg_format_index(base)
+                clock = gadget_configfs.read_clock_frequency(base)
                 log.info(
-                    'UVC: descriptors from configfs: %d frames, maxpacket=%d',
+                    'UVC: descriptors from configfs: %d frames, maxpacket=%d, clock=%s',
                     len(frames),
                     maxpacket,
+                    clock,
                 )
-                return frames, intervals, frame_sizes, maxpacket, format_index
+                return _GadgetDescriptors(
+                    frames=frames,
+                    intervals=intervals,
+                    frame_sizes=frame_sizes,
+                    maxpacket=maxpacket,
+                    format_index=gadget_configfs.mjpeg_format_index(base),
+                    clock_freq=clock if clock is not None else _CLOCK_FREQUENCY,
+                )
             except (OSError, ValueError) as exc:
                 log.warning('UVC: configfs read failed (%s); using built-in defaults', exc)
         else:
             log.warning('UVC: no configfs UVC function found; using built-in defaults')
         frames = gadget_frames()
-        intervals = [list(FRAME_INTERVALS) for _ in frames]
-        # 1 byte/pixel MJPEG ceiling, matching the historical buffer sizing.
-        frame_sizes = [w * h for (w, h) in frames]
-        return frames, intervals, frame_sizes, _ISO_MAXPACKET, 1
+        return _GadgetDescriptors(
+            frames=frames,
+            intervals=[list(FRAME_INTERVALS) for _ in frames],
+            # 1 byte/pixel MJPEG ceiling, matching the historical buffer sizing.
+            frame_sizes=[w * h for (w, h) in frames],
+            maxpacket=_ISO_MAXPACKET,
+            format_index=1,
+            clock_freq=_CLOCK_FREQUENCY,
+        )
 
     @staticmethod
     def find_device():
@@ -561,7 +590,11 @@ class UvcGadget(threading.Thread):
         # host sizes its payload requests correctly, and advertise the 48 MHz UVC
         # clock the gadget uses for presentation timestamps.
         ctrl.dwMaxPayloadTransferSize = self._iso_maxpacket
-        ctrl.dwClockFrequency = 48_000_000
+        # Must match the VideoControl header's dwClockFrequency (read from configfs).
+        ctrl.dwClockFrequency = self._clock_freq
+        # FID toggles per frame (D0) + EOF present (D1): describes the payload
+        # framing the kernel UVC gadget actually emits, so it is fixed, not
+        # configfs-derived.
         ctrl.bmFramingInfo = 3
         ctrl.bPreferedVersion = 1
         ctrl.bMinVersion = 1

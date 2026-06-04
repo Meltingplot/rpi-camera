@@ -76,6 +76,21 @@ def read_streaming(base):
     return frames, intervals, frame_sizes, maxpacket
 
 
+def read_clock_frequency(base):
+    """Return the VideoControl header's ``dwClockFrequency`` (Hz), or ``None``.
+
+    This is the device clock the payload-header timestamps reference. The
+    PROBE/COMMIT ``dwClockFrequency`` must echo the same value so the host
+    interprets timestamps against the clock the descriptor actually advertises.
+    """
+    for path in glob.glob(os.path.join(base, 'control', 'header', '*', 'dwClockFrequency')):
+        try:
+            return _read_int(path)
+        except (OSError, ValueError):
+            return None
+    return None
+
+
 def mjpeg_format_index(base):
     """Return the 1-based ``bFormatIndex`` of the MJPEG streaming format.
 
