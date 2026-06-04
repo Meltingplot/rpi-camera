@@ -43,6 +43,7 @@ CURATED_CONTROLS = {
         'ui_type': 'toggle',
         'label': 'Auto exposure',
         'group': 'exposure',
+        'default': True,
     },
     'ExposureTime': {
         'ui_type': 'slider',
@@ -78,6 +79,7 @@ CURATED_CONTROLS = {
         'ui_type': 'toggle',
         'label': 'Auto white balance',
         'group': 'white_balance',
+        'default': True,
     },
     'AwbMode': {
         'ui_type': 'select',
@@ -147,6 +149,9 @@ CURATED_CONTROLS = {
         'label': 'Autofocus mode',
         'group': 'focus',
         'options': ['Manual', 'Auto', 'Continuous'],
+        # Continuous autofocus by default (keeps a hands-off camera in focus);
+        # only applied if the sensor advertises AF. 'Auto' is one-shot/triggered.
+        'default': 'Continuous',
     },
     'LensPosition': {
         'ui_type': 'slider',
