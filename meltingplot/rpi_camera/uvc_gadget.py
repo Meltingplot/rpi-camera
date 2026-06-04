@@ -93,7 +93,7 @@ def gadget_frames(model=None):
     in this exact (ascending) order for the indices to line up. The largest
     entry is bounded per board to what the hardware can sensibly stream:
 
-    * single-core Pi Zero / Zero W -> up to 1920x1080 (capped to 20 fps below)
+    * single-core Pi Zero / Zero W -> up to 1280x720  (1080p too slow over UVC)
     * Pi Zero 2 W                  -> up to 1920x1080
     * everything else (Pi 4/5/...) -> up to 4608x2592 (IMX708 full sensor)
 
@@ -105,9 +105,9 @@ def gadget_frames(model=None):
     if 'Zero 2' in model:
         return [(640, 480), (1280, 720), (1920, 1080)]
     if 'Zero' in model:
-        # Single-core Zero / Zero W also streams 1080p (capture/encode are
-        # hardware+DMA); only the frame RATE is capped, in the gadget setup.
-        return [(640, 480), (1280, 720), (1920, 1080)]
+        # Single-core Zero / Zero W: UVC capped at 720p (1080p is too slow over
+        # USB on one ARMv6 core). The HTTP/web stream is not limited by this.
+        return [(640, 480), (1280, 720)]
     return [(640, 480), (1280, 720), (1920, 1080), (2304, 1296), (4608, 2592)]
 
 
