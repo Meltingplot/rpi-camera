@@ -138,6 +138,9 @@ CURATED_CONTROLS = {
         'label': 'Noise reduction',
         'group': 'image',
         'options': ['Off', 'Fast', 'HighQuality', 'Minimal', 'ZSL'],
+        # Default to high-quality NR (applied at startup via
+        # load_and_apply_persisted unless the user persisted another choice).
+        'default': 'HighQuality',
     },
     'AfMode': {
         'ui_type': 'select',
