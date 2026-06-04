@@ -207,17 +207,17 @@ def _host_active(event):
 # Pi by the usb0 dnsmasq (image: dnsmasq-shared.d/captive-portal.conf); answering
 # them with a 302 to the webcam UI (instead of the expected success body) makes
 # the connected host detect a captive portal and surface the camera page.
-_CAPTIVE_PROBE_PATHS = frozenset({
-    '/connecttest.txt',            # Windows NCSI
-    '/ncsi.txt',                   # Windows NCSI (legacy)
-    '/redirect',                   # Windows
-    '/hotspot-detect.html',        # Apple
+_CAPTIVE_PROBE_PATHS = {
+    '/connecttest.txt',  # Windows NCSI
+    '/ncsi.txt',  # Windows NCSI (legacy)
+    '/redirect',  # Windows
+    '/hotspot-detect.html',  # Apple
     '/library/test/success.html',  # Apple
-    '/generate_204',               # Android / Chrome
-    '/gen_204',                    # Android / Chrome
-    '/canonical.html',             # Firefox / NetworkManager
-    '/success.txt',                # NetworkManager / generic
-})
+    '/generate_204',  # Android / Chrome
+    '/gen_204',  # Android / Chrome
+    '/canonical.html',  # Firefox / NetworkManager
+    '/success.txt',  # NetworkManager / generic
+}
 
 
 class StreamingHandler(server.BaseHTTPRequestHandler):
