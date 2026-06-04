@@ -203,6 +203,23 @@ def _host_active(event):
     return bool(event is not None and event.is_set())
 
 
+# OS connectivity-check probe paths. The matching hostnames are hijacked to this
+# Pi by the usb0 dnsmasq (image: dnsmasq-shared.d/captive-portal.conf); answering
+# them with a 302 to the webcam UI (instead of the expected success body) makes
+# the connected host detect a captive portal and surface the camera page.
+_CAPTIVE_PROBE_PATHS = frozenset({
+    '/connecttest.txt',            # Windows NCSI
+    '/ncsi.txt',                   # Windows NCSI (legacy)
+    '/redirect',                   # Windows
+    '/hotspot-detect.html',        # Apple
+    '/library/test/success.html',  # Apple
+    '/generate_204',               # Android / Chrome
+    '/gen_204',                    # Android / Chrome
+    '/canonical.html',             # Firefox / NetworkManager
+    '/success.txt',                # NetworkManager / generic
+})
+
+
 class StreamingHandler(server.BaseHTTPRequestHandler):
     """A request handler for serving the MJPEG stream."""
 
@@ -268,9 +285,43 @@ class HttpHandler(server.BaseHTTPRequestHandler):
     # never goes through this handler — so the JSON control endpoints below
     # cannot starve frame delivery, even under POST flood.
 
+    def _serve_snapshot(self):
+        """Serve the current frame as a single JPEG (refused while a host streams)."""
+        if _host_active(self.host_streaming):
+            self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
+            return
+        try:
+            with self.frame_buffer.condition:
+                if not self.frame_buffer.condition.wait(timeout=5):
+                    self.send_error(503, 'Camera frame unavailable')
+                    return
+                frame = self.frame_buffer.frame
+            self.send_response(200)
+            self.send_header('Age', 0)
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', 'image/jpeg')
+            self.send_header('Content-Length', len(frame))
+            self.end_headers()
+            self.wfile.write(frame)
+        except Exception as e:
+            logging.warning('Removed client %s: %s', self.client_address, str(e))
+
     def do_GET(self):  # noqa:N802
         """Serve the HTML page, current frame as JPEG, or current control state."""
         url = urlparse(self.path)
+
+        # Captive-portal: OS connectivity-check probes (their hostnames are
+        # pointed at this Pi by the usb0 dnsmasq) must NOT get the success
+        # response they expect — 302 them to the webcam UI so the host flags a
+        # captive portal and pops up "Sign in", landing the user on the camera.
+        if url.path in _CAPTIVE_PROBE_PATHS:
+            host_ip = self.connection.getsockname()[0]
+            self.send_response(302)
+            self.send_header('Location', 'http://%s/' % host_ip)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
 
         if url.path in ('/', '/index.html'):
             self.send_response(200)
@@ -282,25 +333,7 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             # Cheap endpoint the UI polls to learn when the host owns the camera.
             self._send_json(200, {'host_active': _host_active(self.host_streaming)})
         elif url.path in ('/picture/1/current/', '/snapshot'):
-            if _host_active(self.host_streaming):
-                self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
-                return
-            try:
-                with self.frame_buffer.condition:
-                    if not self.frame_buffer.condition.wait(timeout=5):
-                        self.send_error(503, 'Camera frame unavailable')
-                        return
-                    frame = self.frame_buffer.frame
-                self.send_response(200)
-                self.send_header('Age', 0)
-                self.send_header('Cache-Control', 'no-cache, private')
-                self.send_header('Pragma', 'no-cache')
-                self.send_header('Content-Type', 'image/jpeg')
-                self.send_header('Content-Length', len(frame))
-                self.end_headers()
-                self.wfile.write(frame)
-            except Exception as e:
-                logging.warning('Removed client %s: %s', self.client_address, str(e))
+            self._serve_snapshot()
         elif url.path == '/api/controls':
             if self.controller is None:
                 self.send_error(503, 'Controls unavailable')
