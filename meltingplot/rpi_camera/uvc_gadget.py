@@ -112,10 +112,17 @@ def gadget_frames(model=None):
 
 
 def _default_frame_index(frames):
-    """1-based default ``bFrameIndex`` — 720p where present, else the first."""
-    for i, (w, h) in enumerate(frames, start=1):
-        if (w, h) == (1280, 720):
-            return i
+    """1-based default ``bFrameIndex`` — 1080p where present, else 720p, else first.
+
+    Matches the per-board boot resolution (``server._default_resolution``: 1080p
+    on every board except the single-core Zero/Zero W, which tops out at 720p),
+    so a USB host opening the stream at the gadget's default frame does NOT force
+    a capture-pipeline resize (which briefly stalls frames -> iso underruns).
+    """
+    for target in ((1920, 1080), (1280, 720)):
+        for i, (w, h) in enumerate(frames, start=1):
+            if (w, h) == target:
+                return i
     return 1
 
 
