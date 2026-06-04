@@ -20,6 +20,7 @@ are absent entirely on sensors without AF).
 import json
 import logging
 import os
+import subprocess
 import tempfile
 import threading
 import time
@@ -174,6 +175,14 @@ CURATED_CONTROLS = {
         'group': 'capture',
         'options': ['0', '90', '180', '270'],
     },
+    # Not a libcamera control — a toggle for the image's WiFi safety watchdog
+    # systemd unit (reboot on lost wlan0). See SYSTEM_CONTROLS below; only
+    # surfaced when that unit is actually present on the device.
+    'RebootOnWifiLoss': {
+        'ui_type': 'toggle',
+        'label': 'Reboot on WiFi loss',
+        'group': 'system',
+    },
 }
 
 # Controls that change the capture pipeline (and therefore the USB UVC
@@ -183,6 +192,57 @@ CURATED_CONTROLS = {
 # here too: 0/180 are sensor hflip+vflip (a configure()-time Transform) and
 # 90/270 set a JPEG EXIF tag, so neither is a live libcamera control.
 RECONFIG_CONTROLS = frozenset({'Resolution', 'FrameRate', 'Rotation'})
+
+# Controls that drive a SYSTEM service rather than libcamera or the capture
+# pipeline. They are never passed to set_controls and never persisted to
+# controls.json — the systemd unit's own enabled-state is the single source of
+# truth (read back live). Applying one runs systemctl via sudo.
+SYSTEM_CONTROLS = frozenset({'RebootOnWifiLoss'})
+
+# The WiFi safety watchdog unit is provided by the Pi image (pi-cam-gen
+# stage2/02-net-tweaks), shipped disabled; we only toggle it here.
+_WIFI_WATCHDOG_UNIT = 'reboot_on_wifi_disconnect.service'
+
+
+def _systemctl(verb, *, sudo):
+    """Run ``systemctl <verb> [--now] <unit>``; return the CompletedProcess.
+
+    ``enable``/``disable`` need root (sudo, granted by a pinned sudoers rule in
+    the image); ``is-enabled`` is read-only and runs unprivileged.
+    """
+    cmd = []
+    if sudo and os.geteuid() != 0:
+        cmd.append('sudo')
+    cmd.append('systemctl')
+    cmd.append(verb)
+    if verb in ('enable', 'disable'):
+        cmd.append('--now')
+    cmd.append(_WIFI_WATCHDOG_UNIT)
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _wifi_watchdog_present():
+    """Return True if the image shipped the WiFi watchdog unit (so we can toggle it)."""
+    return os.path.exists('/etc/systemd/system/' + _WIFI_WATCHDOG_UNIT)
+
+
+def _wifi_watchdog_enabled():
+    """Return True if the watchdog unit is currently enabled (live systemd state)."""
+    try:
+        return _systemctl('is-enabled', sudo=False).stdout.strip() == 'enabled'
+    except Exception:
+        return False
+
+
+def _set_wifi_watchdog(on):
+    """Enable+start (or disable+stop) the watchdog unit; raise on failure."""
+    verb = 'enable' if on else 'disable'
+    result = _systemctl(verb, sudo=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            'systemctl %s --now %s failed: %s' % (verb, _WIFI_WATCHDOG_UNIT, result.stderr.strip()),
+        )
+
 
 # Map each enum-valued control to the libcamera enum class that owns its
 # values. Used to translate persisted/JSON string names ("Continuous") to
@@ -268,6 +328,10 @@ class CameraController:
         # FrameRate/Resolution are virtual (capture-pipeline) controls that
         # camera_controls doesn't list, so accept them unconditionally.
         self._supported = (set(CURATED_CONTROLS.keys()) & available) | RECONFIG_CONTROLS
+        # System toggles only when their backing service is actually present
+        # (the image ships the WiFi watchdog unit; dev hosts won't have it).
+        if _wifi_watchdog_present():
+            self._supported |= SYSTEM_CONTROLS
 
     def register_change_listener(self, fn):
         """Register ``fn(merged_state, changed_reconfig)`` for reconfig changes.
@@ -307,7 +371,12 @@ class CameraController:
     def get_state(self):
         """Return a JSON-safe snapshot of currently applied UI values."""
         with self._lock:
-            return dict(self._state)
+            state = dict(self._state)
+        # System toggles aren't persisted in _state — read their live state
+        # from systemd so the UI always reflects reality.
+        if 'RebootOnWifiLoss' in self._supported:
+            state['RebootOnWifiLoss'] = _wifi_watchdog_enabled()
+        return state
 
     def bounds(self, name):
         """Return the sensor's ``(min, max, default)`` for a control, or None.
@@ -355,6 +424,41 @@ class CameraController:
             except Exception:
                 log.exception('Failed to re-apply live controls after reconfigure')
 
+    def _filter_supported(self, partial):
+        """Drop unsupported keys (logged); return only controls we can apply."""
+        out = {}
+        for name, value in partial.items():
+            if name in self._supported:
+                out[name] = value
+            else:
+                log.info('Ignoring unsupported control %s', name)
+        return out
+
+    @staticmethod
+    def _bucket(filtered):
+        """Split into (system, reconfig, live) controls.
+
+        SYSTEM controls drive a systemd unit (not libcamera, not persisted);
+        RECONFIG controls (Resolution/FrameRate/Rotation) are persisted and
+        handed to the reconfig listeners; the rest are live libcamera controls.
+        """
+        system, reconfig, live = {}, {}, {}
+        for k, v in filtered.items():
+            if k in SYSTEM_CONTROLS:
+                system[k] = v
+            elif k in RECONFIG_CONTROLS:
+                reconfig[k] = v
+            else:
+                live[k] = v
+        return system, reconfig, live
+
+    @staticmethod
+    def _apply_system(system):
+        """Run the systemd action for each SYSTEM control (outside the lock)."""
+        for name, value in system.items():
+            if name == 'RebootOnWifiLoss':
+                _set_wifi_watchdog(bool(value))
+
     def apply(self, partial):
         """Apply a partial control dict to the live camera and persist it.
 
@@ -365,29 +469,23 @@ class CameraController:
         if not isinstance(partial, dict):
             raise ValueError('controls payload must be a JSON object')
 
-        filtered = {}
-        for name, value in partial.items():
-            if name not in self._supported:
-                log.info('Ignoring unsupported control %s', name)
-                continue
-            filtered[name] = value
-
+        filtered = self._filter_supported(partial)
         if not filtered:
             return self.get_state()
 
-        # Capture-pipeline controls (Resolution/FrameRate) are persisted and
-        # handed to the reconfig listeners; only the rest are live libcamera
-        # controls applied via set_controls.
-        reconfig = {k: v for k, v in filtered.items() if k in RECONFIG_CONTROLS}
-        live = {k: v for k, v in filtered.items() if k not in RECONFIG_CONTROLS}
+        system, reconfig, live = self._bucket(filtered)
+        self._apply_system(system)
 
         with self._lock:
             if live:
                 translated = {name: _to_libcamera(name, value) for name, value in live.items()}
                 self._picam2.set_controls(translated)
-            self._state.update(filtered)
+            # System toggles are not persisted — systemd is their source of truth.
+            self._state.update({k: v for k, v in filtered.items() if k not in SYSTEM_CONTROLS})
             self._save_locked()
             merged = dict(self._state)
+        if 'RebootOnWifiLoss' in self._supported:
+            merged['RebootOnWifiLoss'] = _wifi_watchdog_enabled()
 
         # Fire reconfig listeners outside the lock: reconfiguring the camera
         # and re-binding the USB gadget can take seconds (the host sees a USB
@@ -415,6 +513,8 @@ class CameraController:
         info = self._picam2.camera_controls
         defaults = {}
         for name in self._supported:
+            if name in SYSTEM_CONTROLS:
+                continue  # not a libcamera control; leave the systemd unit as-is
             curated = CURATED_CONTROLS.get(name, {}).get('default')
             if curated is not None:
                 defaults[name] = _to_libcamera(name, curated)
