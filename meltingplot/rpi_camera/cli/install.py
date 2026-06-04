@@ -66,7 +66,7 @@ def _makedirs(path):
     envvar='RPI_CAMERA_GATEWAY',
     default='10.42.0.1',
     show_default=True,
-    help='Default IPv4 gateway. Also used by the WiFi watchdog as the ping target.',
+    help='Default IPv4 gateway (used by --configure-network nmcli setup).',
 )
 @click.option(
     '--dns',
@@ -74,13 +74,6 @@ def _makedirs(path):
     default='10.42.0.1',
     show_default=True,
     help='DNS server.',
-)
-@click.option(
-    '--iface',
-    envvar='RPI_CAMERA_IFACE',
-    default='wlan0',
-    show_default=True,
-    help='WiFi interface name the watchdog monitors.',
 )
 @click.option(
     '--service-user',
@@ -105,50 +98,21 @@ def _makedirs(path):
     "directory.",
 )
 @click.option(
-    '--ping-failures-before-reboot',
-    envvar='RPI_CAMERA_PING_FAILURES_BEFORE_REBOOT',
-    type=int,
-    default=30,
-    show_default=True,
-    help='WiFi watchdog: consecutive ping failures to the gateway before the safety-net '
-    'reboot fires (seconds, since the loop pings once per second).',
-)
-@click.option(
-    '--initial-association-timeout',
-    envvar='RPI_CAMERA_INITIAL_ASSOCIATION_TIMEOUT',
-    type=int,
-    default=120,
-    show_default=True,
-    help='WiFi watchdog: seconds to wait for the first WiFi association at boot before rebooting.',
-)
-@click.option(
     '--configure-network',
     envvar='RPI_CAMERA_CONFIGURE_NETWORK',
     is_flag=True,
     help='Opt in to nmcli static IP setup on the chosen connection. '
     'Off by default — IP config is expected to come from the Pi image itself.',
 )
-@click.option(
-    '--wifi-watchdog/--no-wifi-watchdog',
-    envvar='RPI_CAMERA_WIFI_WATCHDOG',
-    default=True,
-    show_default=True,
-    help='Install the reboot-on-wifi-disconnect watchdog. Independent of --configure-network: '
-    'the watchdog is camera-specific safety, not network setup.',
-)
 def install(
     connection,
     address,
     gateway,
     dns,
-    iface,
     service_user,
     service_group,
     working_directory,
-    ping_failures_before_reboot,
-    initial_association_timeout,
     configure_network,
-    wifi_watchdog,
 ):
     """Install the RPi Camera as a systemd service."""
     import getpass
@@ -243,43 +207,10 @@ def install(
         subprocess.run([*sudo, 'nmcli', 'con', 'down', connection], check=True)
         subprocess.run([*sudo, 'nmcli', 'con', 'up', connection], check=True)
 
-    if wifi_watchdog:
-        click.echo(f'Installing WiFi watchdog for iface={iface}, gateway={gateway}')
-        wifi_script_file = os.path.join(sys.prefix, 'reboot_on_wifi_disconnect.sh')
-        subprocess.run(
-            [*sudo, 'cp', '-f', wifi_script_file, '/usr/local/bin/reboot_on_wifi_disconnect.sh'],
-            check=True,
-        )
-        subprocess.run([*sudo, 'chmod', '+x', '/usr/local/bin/reboot_on_wifi_disconnect.sh'], check=True)
-        # When non-root, sudo strips env, so we hand the env vars via the
-        # `VAR=val cmd` form that sudo accepts. When root, plain env= works.
-        watchdog_env = {
-            'WIFI_IFACE': iface,
-            'GATEWAY': gateway,
-            'PING_FAILURES_BEFORE_REBOOT': str(ping_failures_before_reboot),
-            'INITIAL_ASSOCIATION_TIMEOUT': str(initial_association_timeout),
-        }
-        if sudo:
-            subprocess.run(
-                [
-                    *sudo,
-                    *(f'{k}={v}' for k, v in watchdog_env.items()),
-                    '/usr/local/bin/reboot_on_wifi_disconnect.sh',
-                    'install',
-                ],
-                check=True,
-            )
-        else:
-            subprocess.run(
-                ['/usr/local/bin/reboot_on_wifi_disconnect.sh', 'install'],
-                check=True,
-                env={
-                    **os.environ,
-                    **watchdog_env,
-                },
-            )
-    else:
-        click.echo('Skipping WiFi watchdog install (--no-wifi-watchdog).')
+    # NOTE: the WiFi safety watchdog (reboot on lost wlan0) is no longer
+    # installed here — it is a system service owned by the Pi image
+    # (pi-cam-gen stage2/02-net-tweaks), shipped disabled and toggled from the
+    # web UI. A reboot service does not belong in the Python camera package.
 
     # `/run/systemd/system` exists iff systemd is the active init AND running.
     # In image-build chroots it's absent, so daemon-reload/start would fail —

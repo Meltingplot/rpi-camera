@@ -43,7 +43,7 @@ include-package-data = true
 zip-safe = false
 # install.py reads these from sys.prefix at runtime — keep them at the
 # install prefix root rather than inside the package.
-data-files = { "" = ["rpi-camera.service", "reboot_on_wifi_disconnect.sh"] }
+data-files = { "" = ["rpi-camera.service"] }
 
 [tool.setuptools.package-data]
 # Ship the controls UI's HTML/JS/CSS so server.py can read it via

@@ -4,5 +4,4 @@ include README.rst
 include LICENSE
 include pyproject.toml
 include rpi-camera.service
-include reboot_on_wifi_disconnect.sh
 recursive-include meltingplot/rpi_camera/web *
