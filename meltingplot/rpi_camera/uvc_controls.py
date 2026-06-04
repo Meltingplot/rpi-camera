@@ -23,11 +23,62 @@ have bespoke encodings.
 import logging
 import struct
 
+from . import gadget_configfs
+
 log = logging.getLogger(__name__)
 
 # configfs default unit/terminal IDs (rpi-cam-gadget-setup.sh keeps these).
 CAMERA_TERMINAL_ID = 1
 PROCESSING_UNIT_ID = 2
+
+# UVC-spec mapping from a bmControls bit position to its control selector, per
+# unit type. Used to validate that the configfs bmControls bitmaps (written by
+# rpi-cam-gadget-setup.sh) advertise exactly the (unit, selector) pairs this
+# bridge can service: a bit advertised but unhandled stalls the control
+# endpoint when the host queries it.
+_PU_BIT_SELECTOR = {
+    0: 0x02,
+    1: 0x03,
+    2: 0x06,
+    3: 0x07,
+    4: 0x08,
+    5: 0x09,
+    6: 0x0A,
+    7: 0x0C,
+    8: 0x01,
+    9: 0x04,
+    10: 0x05,
+    11: 0x10,
+    12: 0x0B,
+    13: 0x0D,
+    14: 0x0E,
+    15: 0x0F,
+    16: 0x11,
+    17: 0x12,
+    18: 0x13,
+}
+_CT_BIT_SELECTOR = {
+    0: 0x01,
+    1: 0x02,
+    2: 0x03,
+    3: 0x04,
+    4: 0x05,
+    5: 0x06,
+    6: 0x07,
+    7: 0x09,
+    8: 0x0A,
+    9: 0x0B,
+    10: 0x0C,
+    11: 0x0D,
+    12: 0x0E,
+    13: 0x0F,
+    14: 0x10,
+    17: 0x08,
+    18: 0x11,
+    19: 0x12,
+    20: 0x13,
+    21: 0x14,
+}
 
 # UVC class request codes (subset; kept local to avoid importing uvc_gadget).
 SET_CUR = 0x01
@@ -176,6 +227,7 @@ class UvcControlBridge:
     def __init__(self, controller):
         """Build the (unit, selector) -> control table for ``controller``."""
         self._table = self._build(controller)
+        self._validate_against_configfs()
 
     @staticmethod
     def _build(c):
@@ -218,6 +270,70 @@ class UvcControlBridge:
             ),
         }
         return table
+
+    def _validate_against_configfs(self):
+        """Loudly flag any drift between this bridge and the gadget's bmControls.
+
+        configfs (written by rpi-cam-gadget-setup.sh) decides which controls the
+        host sees. A control it advertises but this bridge does NOT handle stalls
+        the control endpoint when the host queries it; one this bridge handles but
+        configfs does not advertise is simply dead. Best-effort: silent when no
+        UVC gadget is configured or the bitmaps can't be read.
+        """
+        base = gadget_configfs.find_uvc_function()
+        if base is None:
+            return
+        cfg = gadget_configfs.read_controls(base)
+        if not cfg:
+            return
+        cam_id = cfg.get('camera_id', CAMERA_TERMINAL_ID)
+        pu_id = cfg.get('processing_id', PROCESSING_UNIT_ID)
+        if (cam_id, pu_id) != (CAMERA_TERMINAL_ID, PROCESSING_UNIT_ID):
+            log.error(
+                'UVC controls: configfs unit IDs (camera=%d, processing=%d) differ from the '
+                'bridge (camera=%d, processing=%d) -> control requests will misroute; '
+                'sync rpi-cam-gadget-setup.sh with uvc_controls.py',
+                cam_id,
+                pu_id,
+                CAMERA_TERMINAL_ID,
+                PROCESSING_UNIT_ID,
+            )
+            return  # per-control comparison below would be all-noise
+
+        advertised = set()
+        for unit_id, label, bitmap, bit_sel in (
+            (CAMERA_TERMINAL_ID, 'CT', cfg.get('camera', b''), _CT_BIT_SELECTOR),
+            (PROCESSING_UNIT_ID, 'PU', cfg.get('processing', b''), _PU_BIT_SELECTOR),
+        ):
+            for bit in range(len(bitmap) * 8):
+                if not gadget_configfs.bit_set(bitmap, bit):
+                    continue
+                selector = bit_sel.get(bit)
+                if selector is None:
+                    log.error(
+                        'UVC controls: configfs advertises unknown %s bit D%d -> host query may STALL',
+                        label,
+                        bit,
+                    )
+                    continue
+                advertised.add((unit_id, selector))
+
+        handled = set(self._table)
+        for unit, selector in sorted(advertised - handled):
+            log.error(
+                'UVC controls: configfs advertises (unit=%d, selector=%#x) the bridge does NOT '
+                'handle -> host query will STALL the control endpoint; add a mapping or clear '
+                'the bmControls bit in rpi-cam-gadget-setup.sh',
+                unit,
+                selector,
+            )
+        for unit, selector in sorted(handled - advertised):
+            log.warning(
+                'UVC controls: bridge maps (unit=%d, selector=%#x) that configfs does NOT '
+                'advertise -> host will never query it (set the bmControls bit to expose it)',
+                unit,
+                selector,
+            )
 
     def handles(self, unit, selector):
         """Return True if (unit, selector) is a control this bridge maps."""

@@ -37,6 +37,7 @@ import select
 import struct
 import threading
 
+from . import gadget_configfs
 from .uvc_controls import UvcControlBridge
 
 log = logging.getLogger(__name__)
@@ -49,16 +50,16 @@ log = logging.getLogger(__name__)
 # resolution just yields a smaller (self-describing) JPEG that the host
 # decodes at its embedded size, with no USB re-enumeration.
 MAX_FPS = 30
-# Advertised MJPEG frame intervals (100 ns units), fastest first:
-# 30/15/10/5/4/2/1 fps. MUST match the dwFrameInterval list written by
-# rpi-cam-gadget-setup.sh.
+# Fallback defaults ONLY. At runtime the pump reads the frames, per-frame
+# intervals and streaming_maxpacket back from configfs (the values
+# rpi-cam-gadget-setup.sh actually wrote — the single source of truth), so it
+# can never advertise something the kernel didn't. These are used only if
+# configfs is absent/unreadable (e.g. running outside the gadget image).
+#
+# Advertised MJPEG frame intervals (100 ns units), fastest first: 30/15/10/5/4/2/1 fps.
 FRAME_INTERVALS = (333333, 666666, 1000000, 2000000, 2500000, 5000000, 10000000)
-# MUST mirror streaming_maxpacket in rpi-cam-gadget-setup.sh. Reported to the
-# host in PROBE/COMMIT (dwMaxPayloadTransferSize) so it paces its isoc payload
-# requests to what the endpoint can actually carry per microframe. Capped at
-# 1024 (single-transaction iso): the Pi's dwc2 UDC has no high-bandwidth iso,
-# so a larger value here makes the host reserve bandwidth the gadget can never
-# deliver -> underruns and stalled/intermittent frames.
+# dwMaxPayloadTransferSize fallback. >1024 needs high-bandwidth iso, which the
+# Pi's dwc2 UDC lacks; the real value comes from configfs streaming_maxpacket.
 _ISO_MAXPACKET = 1024
 
 
@@ -111,21 +112,21 @@ def _fps_from_interval(interval):
     return max(1, min(MAX_FPS, round(10_000_000 / interval)))
 
 
-def _clamp_interval(interval):
+def _snap_interval(interval, intervals):
     """Snap a requested frame interval to the nearest advertised value.
 
-    FRAME_INTERVALS is ascending (fastest first). We return the first listed
-    interval >= the request (rounding the fps down to a supported rate), or the
-    slowest if the request is below every listed rate. UVC requires the device
-    to echo back a value it actually advertised, not an arbitrary in-between
-    interval, so this snaps instead of merely clamping the range.
+    ``intervals`` is the chosen frame's advertised list, ascending (fastest
+    first). Returns the first entry >= the request (rounding the fps down to a
+    supported rate), or the slowest if the request is below every listed rate.
+    UVC requires the device to echo back a value it actually advertised, not an
+    arbitrary in-between interval, so this snaps instead of clamping the range.
     """
     if interval <= 0:
-        return FRAME_INTERVALS[0]
-    for iv in FRAME_INTERVALS:
+        return intervals[0]
+    for iv in intervals:
         if iv >= interval:
             return iv
-    return FRAME_INTERVALS[-1]
+    return intervals[-1]
 
 
 # --- ioctl number construction (asm-generic _IOC, used by arm) ---------
@@ -459,9 +460,11 @@ class UvcGadget(threading.Thread):
         # eventfd the frame buffer pokes on every new frame, so the select()
         # loop can block on "new frame OR V4L2 event" with no timeout/poll.
         self._wake_fd = os.eventfd(0, os.EFD_NONBLOCK | os.EFD_CLOEXEC)
-        self._frames = gadget_frames()
+        # Frames, per-frame intervals and iso maxpacket come from configfs (the
+        # gadget the kernel actually advertised), never hardcoded here.
+        self._frames, self._frame_intervals, self._iso_maxpacket = self._load_descriptors()
         self._frame_index = _default_frame_index(self._frames)  # 1-based bFrameIndex
-        self._interval = FRAME_INTERVALS[0]  # advertised default: 30 fps
+        self._interval = self._frame_intervals[self._frame_index - 1][0]  # default frame, fastest
         self._width, self._height = self._frames[self._frame_index - 1]
         # Buffers are sized to the *committed* frame at STREAMON; 1 byte/pixel
         # is a safe MJPEG ceiling (~3-5x the largest realistic frame).
@@ -479,6 +482,33 @@ class UvcGadget(threading.Thread):
         self._dqevent_fails = 0
         self._empty_fills = 0
         self._dqbuf_errs = 0
+
+    @staticmethod
+    def _load_descriptors():
+        """Frames, per-frame intervals and iso maxpacket, read from configfs.
+
+        configfs (written by rpi-cam-gadget-setup.sh) is the source of truth, so
+        PROBE/COMMIT can never advertise a frame/interval/payload size the kernel
+        didn't. Falls back to the built-in defaults only if configfs is absent or
+        unreadable (logged) — e.g. when run outside the gadget image.
+        """
+        base = gadget_configfs.find_uvc_function()
+        if base is not None:
+            try:
+                frames, intervals, maxpacket = gadget_configfs.read_streaming(base)
+                log.info(
+                    'UVC: descriptors from configfs: %d frames, maxpacket=%d',
+                    len(frames),
+                    maxpacket,
+                )
+                return frames, intervals, maxpacket
+            except (OSError, ValueError) as exc:
+                log.warning('UVC: configfs read failed (%s); using built-in defaults', exc)
+        else:
+            log.warning('UVC: no configfs UVC function found; using built-in defaults')
+        frames = gadget_frames()
+        intervals = [list(FRAME_INTERVALS) for _ in frames]
+        return frames, intervals, _ISO_MAXPACKET
 
     @staticmethod
     def find_device():
@@ -518,13 +548,13 @@ class UvcGadget(threading.Thread):
         ctrl.bmHint = 1
         ctrl.bFormatIndex = 1  # single MJPEG format
         ctrl.bFrameIndex = frame_index
-        ctrl.dwFrameInterval = _clamp_interval(interval)
+        ctrl.dwFrameInterval = _snap_interval(interval, self._frame_intervals[frame_index - 1])
         # 1 byte/pixel ceiling for the selected frame (matches buffer sizing).
         ctrl.dwMaxVideoFrameSize = width * height
-        # Match the iso endpoint (streaming_maxpacket) so the host sizes its
-        # payload requests correctly, and advertise the 48 MHz UVC clock the
-        # gadget uses for presentation timestamps.
-        ctrl.dwMaxPayloadTransferSize = _ISO_MAXPACKET
+        # Match the iso endpoint (streaming_maxpacket, read from configfs) so the
+        # host sizes its payload requests correctly, and advertise the 48 MHz UVC
+        # clock the gadget uses for presentation timestamps.
+        ctrl.dwMaxPayloadTransferSize = self._iso_maxpacket
         ctrl.dwClockFrequency = 48_000_000
         ctrl.bmFramingInfo = 3
         ctrl.bPreferedVersion = 1
@@ -706,13 +736,14 @@ class UvcGadget(threading.Thread):
             elif req.bRequest == UVC_GET_INFO:
                 self._send_response(b'\x03')  # GET/SET supported
             elif req.bRequest == UVC_GET_MIN:
-                # Smallest frame, fastest interval.
-                self._send_response(bytes(self._control_for(1, FRAME_INTERVALS[0])))
+                # Smallest frame, its fastest interval.
+                self._send_response(bytes(self._control_for(1, self._frame_intervals[0][0])))
             elif req.bRequest == UVC_GET_MAX:
-                # Largest frame, slowest interval.
-                self._send_response(bytes(self._control_for(len(self._frames), FRAME_INTERVALS[-1])))
+                # Largest frame, its slowest interval.
+                self._send_response(bytes(self._control_for(len(self._frames), self._frame_intervals[-1][-1])))
             elif req.bRequest == UVC_GET_DEF:
-                self._send_response(bytes(self._control_for(_default_frame_index(self._frames), FRAME_INTERVALS[0])))
+                di = _default_frame_index(self._frames)
+                self._send_response(bytes(self._control_for(di, self._frame_intervals[di - 1][0])))
             elif req.bRequest == UVC_GET_CUR:
                 # Current selection for the addressed control: the host reads the
                 # PROBE control while negotiating and the COMMIT control after.
@@ -755,8 +786,9 @@ class UvcGadget(threading.Thread):
             raw + b'\x00' * (ctypes.sizeof(UvcStreamingControl) - len(raw)),
         )
         frame_index = req.bFrameIndex if 1 <= req.bFrameIndex <= len(self._frames) else self._frame_index
-        interval = _clamp_interval(req.dwFrameInterval)
-        ctrl = self._control_for(frame_index, interval)
+        # _control_for snaps the requested interval to one this frame advertises.
+        ctrl = self._control_for(frame_index, req.dwFrameInterval)
+        interval = ctrl.dwFrameInterval
         log.debug(
             'UVC: %s data -> frame %d %dx%d @ %d fps',
             'COMMIT' if cs == UVC_VS_COMMIT_CONTROL else 'PROBE',
