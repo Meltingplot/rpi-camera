@@ -34,6 +34,7 @@ import logging
 import mmap
 import os
 import select
+import signal
 import struct
 import threading
 from collections import namedtuple
@@ -556,14 +557,13 @@ class UvcGadget(threading.Thread):
         camera-pipeline M2M nodes (``bcm2835-isp``, ``bcm2835-codec``,
         ``unicam``) all also report ``V4L2_CAP_VIDEO_OUTPUT``, so matching on
         that capability alone grabs an ISP/codec node instead. Match the
-        driver name and require the output cap; fall back to the first
-        output-capable node only if no ``g_uvc`` node is present, logging it.
+        driver name and require the output cap; return None (UVC disabled) if
+        no ``g_uvc`` node is present rather than feeding a pipeline node.
         """
         try:
             nodes = sorted(n for n in os.listdir('/dev') if n.startswith('video') and n[5:].isdigit())
         except OSError:
             return None
-        fallback = None
         for name in nodes:
             path = '/dev/' + name
             fd = -1
@@ -578,19 +578,17 @@ class UvcGadget(threading.Thread):
                 if driver == 'g_uvc':
                     log.info('UVC gadget node: %s (driver=%s)', path, driver)
                     return path
-                if fallback is None:
-                    fallback = path
             except OSError:
                 continue
             finally:
                 if fd >= 0:
                     os.close(fd)
-        if fallback is not None:
-            log.warning(
-                'no g_uvc gadget node found; UVC function not bound? falling back to %s',
-                fallback,
-            )
-        return fallback
+        # No g_uvc node: the UVC function is not bound. Do NOT fall back to a
+        # camera-pipeline output node (bcm2835-isp/codec all report Video
+        # Output) — driving the ISP was the original bug. Return None so the
+        # pump stays disabled rather than silently feeding the wrong device.
+        log.warning('UVC: no g_uvc gadget node found (function not bound?); UVC disabled')
+        return None
 
     # -- control negotiation ------------------------------------------
     def _control_for(self, frame_index, interval):
@@ -633,8 +631,9 @@ class UvcGadget(threading.Thread):
         try:
             self._fd = os.open(self._device, os.O_RDWR | os.O_NONBLOCK)
         except OSError as exc:
-            log.error('UVC: cannot open %s (%s); pump disabled', self._device, exc)
+            log.error('UVC: cannot open %s (%s)', self._device, exc)
             self._close_wake()
+            self._exit_for_restart('cannot open %s' % self._device)
             return
         # Get woken on every new camera frame via the eventfd.
         self._frame_buffer.add_wake_fd(self._wake_fd)
@@ -651,6 +650,25 @@ class UvcGadget(threading.Thread):
                 os.close(self._fd)
                 self._fd = -1
             self._close_wake()
+        # We only get here if the loop exited. If it was not an explicit stop(),
+        # the gadget node went away (UDC unbound, gadget rebuilt, kernel error)
+        # and we cannot re-acquire it in-process -> restart the whole service.
+        self._exit_for_restart('pump loop exited')
+
+    def _exit_for_restart(self, why):
+        """Terminate the process so systemd (Restart=always) restarts it fresh.
+
+        Called when the pump stops for any reason other than an explicit
+        ``stop()`` — i.e. the UVC gadget device is gone and a new process must
+        re-run :meth:`find_device` to re-acquire it. A normal host disconnect
+        does NOT reach here: it arrives as ``UVC_EVENT_DISCONNECT`` and is
+        handled inside the loop with the fd still valid. No-op during a normal
+        shutdown (``stop()``/SIGTERM), so we never fight systemd's own stop.
+        """
+        if self._stop.is_set():
+            return
+        log.error('UVC: gadget device gone (%s); terminating for a clean restart', why)
+        os.kill(os.getpid(), signal.SIGTERM)
 
     def _close_wake(self):
         """Close the wake eventfd (idempotent)."""
