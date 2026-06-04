@@ -94,7 +94,7 @@ def gadget_frames(model=None):
     entry is bounded per board to what the hardware can sensibly stream:
 
     * single-core Pi Zero / Zero W -> up to 1280x720  (1080p too slow over UVC)
-    * Pi Zero 2 W                  -> up to 1920x1080
+    * Pi Zero 2 W                  -> up to 2304x1296 (IMX708 binned, ~3MP)
     * everything else (Pi 4/5/...) -> up to 4608x2592 (IMX708 full sensor)
 
     The host (UVC consumer) picks one of these; the pump then drives picamera2
@@ -103,7 +103,7 @@ def gadget_frames(model=None):
     if model is None:
         model = _read_board_model()
     if 'Zero 2' in model:
-        return [(640, 480), (1280, 720), (1920, 1080)]
+        return [(640, 480), (1280, 720), (1920, 1080), (2304, 1296)]
     if 'Zero' in model:
         # Single-core Zero / Zero W: UVC capped at 720p (1080p is too slow over
         # USB on one ARMv6 core). The HTTP/web stream is not limited by this.
