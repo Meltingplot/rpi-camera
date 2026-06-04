@@ -626,6 +626,15 @@ def _default_resolution(model=None):
     'this many seconds, the watchdog escalates to a full reboot.',
 )
 @click.option(
+    '--watchdog/--no-watchdog',
+    envvar='RPI_CAMERA_WATCHDOG',
+    default=True,
+    show_default=True,
+    help='Frame-stall watchdog (restart the service, then reboot). Disable on a '
+    'bench/test device so it does not restart or reboot during debugging '
+    '(RPI_CAMERA_WATCHDOG=0).',
+)
+@click.option(
     '--controls-file',
     type=click.Path(dir_okay=False),
     default=None,
@@ -660,6 +669,7 @@ def start(
     watchdog_grace_period,
     watchdog_stall_limit,
     watchdog_restart_window,
+    watchdog,
     controls_file,
     enable_uvc,
     log_level,
@@ -747,6 +757,7 @@ def start(
                 watchdog_grace_period,
                 watchdog_stall_limit,
                 watchdog_restart_window,
+                watchdog,
             ),
         )
     finally:
@@ -773,8 +784,9 @@ async def _run(
     watchdog_grace_period,
     watchdog_stall_limit=5,
     watchdog_restart_window=300,
+    watchdog_enabled=True,
 ):
-    """Run both HTTP servers and the watchdog; exit when any of them stops."""
+    """Run both HTTP servers and (optionally) the watchdog; exit when any stops."""
     loop = asyncio.get_running_loop()
     http = StreamingServer(('', http_port), HttpHandler)
     stream = StreamingServer(('', stream_port), StreamingHandler)
@@ -788,18 +800,24 @@ async def _run(
     loop.add_signal_handler(signal.SIGTERM, stop_event.set)
 
     server_futures = [loop.run_in_executor(None, s.serve_forever) for s in servers]
-    watchdog_task = asyncio.create_task(
-        watchdog(
-            frame_buffer,
-            interval=watchdog_interval,
-            grace_period=watchdog_grace_period,
-            stall_limit=watchdog_stall_limit,
-            restart_window=watchdog_restart_window,
-        ),
-    )
     stop_task = asyncio.create_task(stop_event.wait())
-    pending = (*server_futures, watchdog_task, stop_task)
-    labels = ('http server', 'stream server', 'watchdog', 'stop signal')
+    pending = [*server_futures, stop_task]
+    labels = ['http server', 'stream server', 'stop signal']
+    watchdog_task = None
+    if watchdog_enabled:
+        watchdog_task = asyncio.create_task(
+            watchdog(
+                frame_buffer,
+                interval=watchdog_interval,
+                grace_period=watchdog_grace_period,
+                stall_limit=watchdog_stall_limit,
+                restart_window=watchdog_restart_window,
+            ),
+        )
+        pending.append(watchdog_task)
+        labels.append('watchdog')
+    else:
+        logging.warning('Frame watchdog disabled (--no-watchdog / RPI_CAMERA_WATCHDOG=0)')
 
     try:
         await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
@@ -809,7 +827,8 @@ async def _run(
         for s in servers:
             s.shutdown()
             s.server_close()
-        watchdog_task.cancel()
+        if watchdog_task is not None:
+            watchdog_task.cancel()
         stop_task.cancel()
         results = await asyncio.gather(*pending, return_exceptions=True)
         for label, result in zip(labels, results):
