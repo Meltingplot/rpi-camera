@@ -503,6 +503,7 @@ class UvcGadget(threading.Thread):
         self._pending_vc = None  # (unit, selector) of an in-flight VC SET_CUR
         self._dqevent_fails = 0
         self._empty_fills = 0
+        self._oversized_drops = 0
         self._dqbuf_errs = 0
 
     @staticmethod
@@ -1003,6 +1004,22 @@ class UvcGadget(threading.Thread):
             self._empty_fills += 1
             if self._empty_fills <= 3 or self._empty_fills % 300 == 0:
                 log.debug('UVC: no free buffer for frame (#%d)', self._empty_fills)
+            return False
+        # Drop (never truncate) a JPEG that won't fit the buffer: a skipped
+        # frame is a harmless webcam hiccup, but a truncated JPEG is a corrupt
+        # image on the host. All buffers are the same size (the configured
+        # dwMaxVideoFrameBufferSize), so check the first free one.
+        capacity = len(self._buffers[self._free[0]])
+        if len(frame) > capacity:
+            self._oversized_drops += 1
+            if self._oversized_drops <= 3 or self._oversized_drops % 300 == 0:
+                log.warning(
+                    'UVC: JPEG %d B exceeds buffer %d B; dropping frame (#%d) — '
+                    'raise dwMaxVideoFrameBufferSize if this persists',
+                    len(frame),
+                    capacity,
+                    self._oversized_drops,
+                )
             return False
         index = self._free.pop(0)
         size = self._fill_buffer(index, frame)
