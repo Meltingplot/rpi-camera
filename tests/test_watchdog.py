@@ -34,7 +34,8 @@ def test_stage1_restarts_service_and_records_marker(tmp_path, monkeypatch):
         action = server._escalate_stall(now=1000.0, restart_window=300)
     assert action == 'restart'
     run.assert_called_once_with(
-        ['sudo', 'systemctl', 'restart', 'rpi-camera.service'], check=False,
+        ['sudo', 'systemctl', 'restart', 'rpi-camera.service'],
+        check=False,
     )
     # The attempt is persisted so the next process can escalate.
     assert os.path.exists(marker)
@@ -68,7 +69,8 @@ def test_stale_marker_restarts_again(tmp_path, monkeypatch):
         action = server._escalate_stall(now=2000.0, restart_window=300)  # 1000s later
     assert action == 'restart'
     run.assert_called_once_with(
-        ['sudo', 'systemctl', 'restart', 'rpi-camera.service'], check=False,
+        ['sudo', 'systemctl', 'restart', 'rpi-camera.service'],
+        check=False,
     )
     assert server._read_restart_marker() == 2000.0  # refreshed
 
