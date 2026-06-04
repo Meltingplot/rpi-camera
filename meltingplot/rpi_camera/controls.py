@@ -26,6 +26,9 @@ import time
 
 from libcamera import controls as libcontrols
 
+from . import gadget_configfs
+from .uvc_gadget import gadget_frames
+
 log = logging.getLogger(__name__)
 
 # Hand-picked control set surfaced in the web UI.
@@ -193,6 +196,28 @@ ENUM_TYPES = {
 }
 
 
+def _gadget_resolution_options():
+    """Resolution dropdown options taken from the UVC gadget's advertised frames.
+
+    Prefer the live configfs descriptors (what the bound gadget actually
+    advertises); fall back to the per-board default list, then a static minimum.
+    Returns ``['WxH', ...]`` in the gadget's bFrameIndex (ascending) order so the
+    web UI mirrors exactly what the USB webcam offers.
+    """
+    base = gadget_configfs.find_uvc_function()
+    if base is not None:
+        try:
+            frames = gadget_configfs.read_streaming(base)[0]
+            if frames:
+                return ['%dx%d' % (w, h) for w, h in frames]
+        except Exception:
+            pass
+    try:
+        return ['%dx%d' % (w, h) for w, h in gadget_frames()]
+    except Exception:
+        return ['640x480', '1280x720', '1920x1080']
+
+
 def _to_libcamera(name, value):
     """Translate a JSON-friendly value into what ``set_controls`` expects.
 
@@ -271,6 +296,11 @@ class CameraController:
                 meta['max'] = bounds[1]
                 if 'default' not in meta and bounds[2] is not None:
                     meta['default'] = bounds[2]
+            # The Resolution dropdown mirrors the UVC gadget's advertised frames
+            # so the web UI is constrained to exactly what the USB webcam offers
+            # (per-board, e.g. up to 1080p on a Zero W). No hard-coded list.
+            if name == 'Resolution':
+                meta['options'] = _gadget_resolution_options()
             out[name] = meta
         return out
 
