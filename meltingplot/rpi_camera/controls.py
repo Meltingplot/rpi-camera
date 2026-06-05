@@ -68,6 +68,8 @@ CURATED_CONTROLS = {
         'label': 'AE exposure mode',
         'group': 'exposure',
         'options': ['Normal', 'Short', 'Long', 'Custom'],
+        # Prefer shorter exposures by default (less motion blur).
+        'default': 'Short',
     },
     'AeMeteringMode': {
         'ui_type': 'select',
