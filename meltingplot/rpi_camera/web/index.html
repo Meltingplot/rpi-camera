@@ -322,7 +322,11 @@
     const resetButton = `<div class="group"><h2>Reset</h2>
        <button class="action secondary" id="controls-reset">Reset to defaults</button></div>`;
 
-    root.innerHTML = sections + afButton + resetButton;
+    const updateButton = `<div class="group"><h2>Software update</h2>
+       <button class="action secondary" id="sw-update">Update software</button>
+       <p class="hint">Only available over the USB connection.</p></div>`;
+
+    root.innerHTML = sections + afButton + resetButton + updateButton;
     wireEvents();
   }
 
@@ -390,6 +394,31 @@
           .finally(() => {
             resetBtn.disabled = false;
             resetBtn.textContent = 'Reset to defaults';
+          });
+      });
+    }
+    const updBtn = document.getElementById('sw-update');
+    if (updBtn) {
+      updBtn.addEventListener('click', () => {
+        if (!confirm('Update the camera software now? It will briefly go offline and restart.')) return;
+        updBtn.disabled = true;
+        updBtn.textContent = 'Starting update…';
+        fetch('/api/update', {method: 'POST'})
+          .then(async r => {
+            const data = await r.json().catch(() => ({}));
+            if (r.ok) {
+              showToast(data.message || 'Update started — the camera will restart.', 'ok');
+            } else if (r.status === 403 && Array.isArray(data.instructions)) {
+              alert((data.message || 'Update not allowed from here.') + '\n\n' + data.instructions.join('\n'));
+              showToast('Updates are only allowed over the USB connection', 'bad');
+            } else {
+              showToast(data.message || `Update failed (${r.status})`, 'bad');
+            }
+          })
+          .catch(err => showToast(`Update failed: ${err.message}`, 'bad'))
+          .finally(() => {
+            updBtn.disabled = false;
+            updBtn.textContent = 'Update software';
           });
       });
     }

@@ -203,6 +203,11 @@ def _host_active(event):
     return bool(event is not None and event.is_set())
 
 
+# The usb0 shared-mode network (matches usb0-host.nmconnection in the image).
+# The in-place update endpoint is gated to clients on this network.
+_USB_GATEWAY_IP = '10.55.0.1'
+_USB_SUBNET_PREFIX = '10.55.0.'
+
 # OS connectivity-check probe paths. The matching hostnames are hijacked to this
 # Pi by the usb0 dnsmasq (image: dnsmasq-shared.d/captive-portal.conf); answering
 # them with a 302 to the webcam UI (instead of the expected success body) makes
@@ -365,9 +370,72 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             self._handle_reset_controls()
         elif url.path == '/api/autofocus':
             self._handle_autofocus()
+        elif url.path == '/api/update':
+            self._handle_update()
         else:
             self.send_error(404)
-            self.end_headers()
+
+    def _handle_update(self):
+        """Trigger the in-place software update — only over the USB network.
+
+        Updates run privileged (pip upgrade + overwriting /usr/local/sbin +
+        restart), so they are restricted to clients on the usb0 link; a request
+        from WiFi gets instructions instead. Over SSH an admin runs the script
+        directly. The updater is launched via systemd-run (its own transient
+        unit) so it survives the rpi-camera restart it performs.
+        """
+        client_ip = self.client_address[0]
+        if not client_ip.startswith(_USB_SUBNET_PREFIX):
+            self._send_json(
+                403,
+                {
+                    'error':
+                    'usb-only',
+                    'message':
+                    'Software updates are only allowed over the USB connection.',
+                    'instructions': [
+                        'Connect the camera to your computer with the USB cable.',
+                        'Open http://%s/ over that USB network and press Update again.' % _USB_GATEWAY_IP,
+                        'Or, over SSH on the camera, run:  sudo /usr/local/sbin/rpi-cam-update.sh',
+                    ],
+                },
+            )
+            return
+        try:
+            result = subprocess.run(
+                [
+                    'sudo',
+                    'systemd-run',
+                    '--collect',
+                    '--unit=rpi-cam-update',
+                    '/usr/local/sbin/rpi-cam-update.sh',
+                ],
+                capture_output=True,
+                text=True,
+            )
+        except Exception as exc:
+            self._send_json(500, {'error': 'launch-failed', 'message': str(exc)})
+            return
+        if result.returncode != 0:
+            self._send_json(
+                409,
+                {
+                    'error': 'busy',
+                    'message': 'An update is already running, or it could not be started.',
+                    'detail': result.stderr.strip(),
+                },
+            )
+            return
+        self._send_json(
+            200,
+            {
+                'status':
+                'started',
+                'message':
+                'Update started — the camera will briefly go offline and restart. '
+                'Reload this page in a minute.',
+            },
+        )
 
     def _handle_apply_controls(self):
         """Apply a partial control dict and echo the merged state back."""
