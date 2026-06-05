@@ -17,6 +17,7 @@ connected (the v2/v3/HQ modules expose different ranges, and some controls
 are absent entirely on sensors without AF).
 """
 
+import ipaddress
 import json
 import logging
 import os
@@ -193,6 +194,16 @@ CURATED_CONTROLS = {
         'label': 'Reboot on WiFi loss',
         'group': 'system',
     },
+    # Manual ping target for the WiFi watchdog. Empty = auto-detect the live
+    # default route (the usual case). A fixed IP is useful when the gateway
+    # drops ICMP and you'd rather ping a known-reachable host. Backed by an
+    # EnvironmentFile the image's config helper writes; see SYSTEM_CONTROLS.
+    'WifiWatchdogPingTarget': {
+        'ui_type': 'text',
+        'label': 'Watchdog ping target',
+        'group': 'system',
+        'placeholder': 'auto-detect',
+    },
 }
 
 # Controls that change the capture pipeline (and therefore the USB UVC
@@ -207,11 +218,15 @@ RECONFIG_CONTROLS = frozenset({'Resolution', 'FrameRate', 'Rotation'})
 # pipeline. They are never passed to set_controls and never persisted to
 # controls.json — the systemd unit's own enabled-state is the single source of
 # truth (read back live). Applying one runs systemctl via sudo.
-SYSTEM_CONTROLS = frozenset({'RebootOnWifiLoss'})
+SYSTEM_CONTROLS = frozenset({'RebootOnWifiLoss', 'WifiWatchdogPingTarget'})
 
 # The WiFi safety watchdog unit is provided by the Pi image (pi-cam-gen
 # stage2/02-net-tweaks), shipped disabled; we only toggle it here.
 _WIFI_WATCHDOG_UNIT = 'reboot_on_wifi_disconnect.service'
+# Config helper + EnvironmentFile that the image ships alongside the unit. The
+# helper (root, pinned sudoers) writes the file; we read it back unprivileged.
+_WIFI_WATCHDOG_CONFIG = '/usr/local/sbin/rpi-cam-wifi-watchdog-config.sh'
+_WIFI_WATCHDOG_CONF = '/etc/rpi-camera/wifi-watchdog.conf'
 
 
 def _systemctl(verb, *, sudo):
@@ -252,6 +267,44 @@ def _set_wifi_watchdog(on):
         raise RuntimeError(
             'systemctl %s --now %s failed: %s' % (verb, _WIFI_WATCHDOG_UNIT, result.stderr.strip()),
         )
+
+
+def _wifi_watchdog_ping_target():
+    """Return the configured manual ping target, or '' when auto-detecting.
+
+    Reads the image's EnvironmentFile directly (root-written, world-readable);
+    a missing file or absent key means no override.
+    """
+    try:
+        with open(_WIFI_WATCHDOG_CONF) as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith('PING_TARGET='):
+                    return line.split('=', 1)[1].strip()
+    except OSError:
+        pass
+    return ''
+
+
+def _set_wifi_watchdog_ping_target(value):
+    """Persist the manual ping target via the image's sudo helper.
+
+    ``value`` must be '' (clear / auto-detect) or a valid IP literal; hostnames
+    are rejected because the watchdog pings this once a second with no DNS.
+    """
+    target = (value or '').strip()
+    if target:
+        try:
+            ipaddress.ip_address(target)
+        except ValueError:
+            raise ValueError('ping target must be a valid IP address or empty')
+    cmd = []
+    if os.geteuid() != 0:
+        cmd.append('sudo')
+    cmd += [_WIFI_WATCHDOG_CONFIG, 'set-ping-target', target]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError('%s failed: %s' % (_WIFI_WATCHDOG_CONFIG, result.stderr.strip()))
 
 
 # Map each enum-valued control to the libcamera enum class that owns its
@@ -383,9 +436,11 @@ class CameraController:
         with self._lock:
             state = dict(self._state)
         # System toggles aren't persisted in _state — read their live state
-        # from systemd so the UI always reflects reality.
+        # from systemd / the config file so the UI always reflects reality.
         if 'RebootOnWifiLoss' in self._supported:
             state['RebootOnWifiLoss'] = _wifi_watchdog_enabled()
+        if 'WifiWatchdogPingTarget' in self._supported:
+            state['WifiWatchdogPingTarget'] = _wifi_watchdog_ping_target()
         return state
 
     def bounds(self, name):
@@ -468,6 +523,8 @@ class CameraController:
         for name, value in system.items():
             if name == 'RebootOnWifiLoss':
                 _set_wifi_watchdog(bool(value))
+            elif name == 'WifiWatchdogPingTarget':
+                _set_wifi_watchdog_ping_target(value)
 
     def apply(self, partial):
         """Apply a partial control dict to the live camera and persist it.
@@ -496,6 +553,8 @@ class CameraController:
             merged = dict(self._state)
         if 'RebootOnWifiLoss' in self._supported:
             merged['RebootOnWifiLoss'] = _wifi_watchdog_enabled()
+        if 'WifiWatchdogPingTarget' in self._supported:
+            merged['WifiWatchdogPingTarget'] = _wifi_watchdog_ping_target()
 
         # Fire reconfig listeners outside the lock: reconfiguring the camera
         # and re-binding the USB gadget can take seconds (the host sees a USB

@@ -72,7 +72,7 @@
   .control-label { font-weight: 500; }
   .control-value { color: var(--muted); font-variant-numeric: tabular-nums; font-size: 13px; }
   .control input[type=range] { width: 100%; }
-  .control select, .control input[type=number] {
+  .control select, .control input[type=number], .control input[type=text] {
     background: var(--bg); color: var(--text);
     border: 1px solid var(--border); border-radius: 4px;
     padding: 4px 8px; font: inherit; width: 100%;
@@ -197,6 +197,7 @@
     if (meta.options) return meta.options[0];
     if (meta.ui_type === 'toggle') return false;
     if (meta.ui_type === 'pair') return [1.0, 1.0];
+    if (meta.ui_type === 'text') return '';
     return 0;
   }
 
@@ -296,12 +297,25 @@
       </div>`;
   }
 
+  function renderText(name, meta) {
+    const val = valueOrDefault(name, meta);
+    return `
+      <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
+        <div class="control-row">
+          <span class="control-label">${meta.label}</span>
+        </div>
+        <input type="text" data-name="${name}" data-kind="text"
+               value="${val}" placeholder="${meta.placeholder || ''}">
+      </div>`;
+  }
+
   function renderControl(name, meta) {
     switch (meta.ui_type) {
       case 'slider': return renderSlider(name, meta);
       case 'toggle': return renderToggle(name, meta);
       case 'select': return renderSelect(name, meta);
       case 'pair':   return renderPair(name, meta);
+      case 'text':   return renderText(name, meta);
       default:       return '';
     }
   }
@@ -352,6 +366,10 @@
     });
     root.querySelectorAll('[data-kind=select]').forEach(el => {
       el.addEventListener('change', () => postControl(el.dataset.name, el.value));
+    });
+    root.querySelectorAll('[data-kind=text]').forEach(el => {
+      // 'change' fires on blur/Enter, so we post the final value, not keystrokes.
+      el.addEventListener('change', () => postControl(el.dataset.name, el.value.trim()));
     });
     root.querySelectorAll('[data-kind=pair]').forEach(el => {
       el.addEventListener('change', () => {
