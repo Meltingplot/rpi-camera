@@ -884,8 +884,26 @@ def start(
         coordinator.stop()
 
 
+def _package_version():
+    """Return the installed meltingplot.rpi_camera version (what the UI shows).
+
+    Prefer the installed distribution metadata (reflects what pip installed,
+    i.e. what the in-place updater changes); fall back to the versioneer
+    ``__version__`` for source checkouts, then to 'unknown'.
+    """
+    try:
+        from importlib.metadata import version
+        return version('meltingplot.rpi_camera')
+    except Exception:
+        try:
+            from . import __version__
+            return __version__
+        except Exception:
+            return 'unknown'
+
+
 def _load_page_bytes(stream_port):
-    """Read the bundled landing page from package data and template the stream port."""
+    """Read the bundled landing page from package data and template the stream port + version."""
     try:
         html = importlib.resources.files('meltingplot.rpi_camera').joinpath('web/index.html').read_text(
             encoding='utf-8',
@@ -893,7 +911,9 @@ def _load_page_bytes(stream_port):
     except (FileNotFoundError, ModuleNotFoundError) as exc:
         logging.warning('Bundled landing page not found (%s); falling back to legacy page', exc)
         html = _FALLBACK_PAGE
-    return html.replace('__STREAM_PORT__', str(stream_port)).encode('utf-8')
+    html = html.replace('__STREAM_PORT__', str(stream_port))
+    html = html.replace('__VERSION__', _package_version())
+    return html.encode('utf-8')
 
 
 async def _run(
