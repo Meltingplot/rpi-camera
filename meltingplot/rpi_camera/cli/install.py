@@ -153,8 +153,14 @@ def install(
         tmp_file.write(service_content)
         tmp_file.flush()
 
-        # Copy the service file to /etc/systemd/system
-        subprocess.run([*sudo, 'cp', tmp_file.name, '/etc/systemd/system/rpi-camera.service'], check=True)
+        # Install the service file to /etc/systemd/system. Use `install -m 0644`
+        # (not `cp`): the NamedTemporaryFile is created 0600, which `cp` would
+        # preserve, and systemd warns that a world-inaccessible unit file "has
+        # no effect". 0644 root:root is what systemd expects.
+        subprocess.run(
+            [*sudo, 'install', '-m', '0644', tmp_file.name, '/etc/systemd/system/rpi-camera.service'],
+            check=True,
+        )
 
     executable_file = os.path.join(sys.exec_prefix, 'bin/rpi-camera')
 
