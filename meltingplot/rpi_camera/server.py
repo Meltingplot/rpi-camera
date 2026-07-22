@@ -30,6 +30,10 @@ Endpoints (port 80):
 While a USB host streams the camera as a UVC webcam it owns the device: the
 MJPEG stream and snapshot return 503, control writes return 409, and the web
 UI greys out — resuming automatically once the host stops streaming.
+If no camera is detected at startup the server still comes up, degraded: the
+landing page explains the problem (and reloads itself once fixed), snapshot
+and stream return 503, and a background probe exits the process for a clean
+systemd restart as soon as libcamera reports a camera again.
 Endpoints (port 8081):
     / or /webcam: Serves the MJPEG stream.
 Usage:
@@ -46,6 +50,7 @@ import signal
 import socketserver
 import subprocess
 import time
+from html import escape
 from http import server
 from threading import Condition, Event, Semaphore
 from urllib.parse import urlparse
@@ -232,11 +237,17 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
     # threading.Event set while a USB host streams the camera as a UVC webcam.
     # The HTTP stream yields to it (no dual consumers). None until wired.
     host_streaming = None
+    # Error string set when the server runs degraded because no camera was
+    # detected at startup; the stream then answers 503 instead of stalling.
+    camera_error = None
 
     def do_GET(self):  # noqa:N802
         """Serve the MJPEG stream."""
         url = urlparse(self.path)
         if url.path in ('/', '/webcam'):
+            if self.camera_error:
+                self.send_error(503, 'No camera detected')
+                return
             if _host_active(self.host_streaming):
                 self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
                 return
@@ -285,6 +296,9 @@ class HttpHandler(server.BaseHTTPRequestHandler):
     # While set, the host owns the camera: snapshots and control writes are
     # refused and the UI greys out (the host drives controls over UVC).
     host_streaming = None
+    # Error string set when the server runs degraded because no camera was
+    # detected at startup; page_bytes then holds the explanatory error page.
+    camera_error = None
 
     # The MJPEG hot path lives on a separate StreamingServer (port 8081) and
     # never goes through this handler — so the JSON control endpoints below
@@ -292,6 +306,9 @@ class HttpHandler(server.BaseHTTPRequestHandler):
 
     def _serve_snapshot(self):
         """Serve the current frame as a single JPEG (refused while a host streams)."""
+        if self.camera_error:
+            self.send_error(503, 'No camera detected')
+            return
         if _host_active(self.host_streaming):
             self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
             return
@@ -335,8 +352,15 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(self.page_bytes)
         elif url.path == '/api/status':
-            # Cheap endpoint the UI polls to learn when the host owns the camera.
-            self._send_json(200, {'host_active': _host_active(self.host_streaming)})
+            # Cheap endpoint the UI polls to learn when the host owns the
+            # camera; the degraded no-camera page polls it to reload itself.
+            self._send_json(
+                200,
+                {
+                    'host_active': _host_active(self.host_streaming),
+                    'camera_error': self.camera_error,
+                },
+            )
         elif url.path in ('/picture/1/current/', '/snapshot'):
             self._serve_snapshot()
         elif url.path == '/api/controls':
@@ -825,7 +849,29 @@ def start(
         picam2 = Picamera2()
     except Exception as e:
         logging.error("Error initializing the camera: %s — is a RPi camera connected?", e)
-        raise
+        # Degraded mode instead of crashing: keep the HTTP endpoints up so the
+        # user sees what is wrong (crashing just leaves dead ports and a
+        # systemd restart loop). The camera probe ends the process for a clean
+        # re-init once a camera shows up again.
+        message = str(e) or type(e).__name__
+        if isinstance(e, IndexError):
+            # Picamera2() indexes global_camera_info(); an empty list means
+            # libcamera enumerated no cameras at all.
+            message = 'no camera found (libcamera detected no camera modules)'
+        HttpHandler.page_bytes = _camera_error_page_bytes(message)
+        HttpHandler.camera_error = message
+        StreamingHandler.camera_error = message
+        asyncio.run(
+            _run(
+                frame_buffer,
+                http_port,
+                stream_port,
+                watchdog_interval,
+                watchdog_grace_period,
+                camera_probe=True,
+            ),
+        )
+        return
 
     persist_path = controls_file or os.path.join(
         os.path.expanduser('~'),
@@ -902,6 +948,73 @@ def _package_version():
             return 'unknown'
 
 
+_CAMERA_ERROR_PAGE = """\
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meltingplot RPi Camera &mdash; no camera detected</title>
+<style>
+body { font-family: sans-serif; margin: 2em auto; max-width: 40em; padding: 0 1em; }
+.error { background: #fdecea; border: 1px solid #f5c6cb; color: #721c24; padding: 1em; border-radius: 4px; }
+code { background: #f0f0f0; padding: 0 0.3em; }
+footer { margin-top: 2em; color: #888; font-size: 0.85em; }
+</style>
+</head>
+<body>
+<h1>No camera detected</h1>
+<p class="error">The camera could not be initialized: <strong>__ERROR__</strong></p>
+<p>The streaming server is running, but the Raspberry Pi did not detect a camera module. Please check:</p>
+<ul>
+<li>The camera ribbon cable is seated firmly at both ends and not inserted the wrong way round.</li>
+<li><code>camera_auto_detect=1</code> (or the correct <code>dtoverlay</code> for your sensor) is set in
+<code>/boot/firmware/config.txt</code>.</li>
+<li>Power-cycle the Raspberry Pi &mdash; a full reboot re-probes the camera.</li>
+</ul>
+<p>This page keeps checking and reloads automatically once the camera is available.</p>
+<footer>meltingplot.rpi_camera __VERSION__</footer>
+<script>
+setInterval(function () {
+    fetch('/api/status').then(function (r) { return r.json(); }).then(function (s) {
+        if (!s.camera_error) { location.reload(); }
+    }).catch(function () {});
+}, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+def _camera_error_page_bytes(error):
+    """Render the degraded-mode landing page shown when no camera is available."""
+    page = _CAMERA_ERROR_PAGE.replace('__ERROR__', escape(str(error) or 'no camera found'))
+    page = page.replace('__VERSION__', _package_version())
+    return page.encode('utf-8')
+
+
+async def _camera_probe(interval=30):
+    """Poll for an attached camera while running in degraded (no-camera) mode.
+
+    Returns — which tears down ``_run`` via FIRST_COMPLETED and ends the
+    process — as soon as libcamera reports a camera, so systemd restarts the
+    service into a normal streaming start. Runs forever otherwise; the
+    degraded error page stays up to inform the user.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            cameras = Picamera2.global_camera_info()
+        except Exception as exc:
+            logging.debug('Camera probe failed: %s', exc)
+            continue
+        if cameras:
+            logging.warning(
+                'Camera detected (%s); exiting so systemd restarts into normal streaming',
+                cameras[0].get('Model', 'unknown'),
+            )
+            return
+
+
 def _load_page_bytes(stream_port):
     """Read the bundled landing page from package data and template the stream port + version."""
     try:
@@ -925,8 +1038,14 @@ async def _run(
     watchdog_stall_limit=5,
     watchdog_restart_window=300,
     watchdog_enabled=True,
+    camera_probe=False,
 ):
-    """Run both HTTP servers and (optionally) the watchdog; exit when any stops."""
+    """Run both HTTP servers and (optionally) the watchdog; exit when any stops.
+
+    With ``camera_probe=True`` (degraded no-camera mode) the frame watchdog is
+    replaced by :func:`_camera_probe`, which ends the process once a camera
+    shows up so systemd restarts it into a normal streaming start.
+    """
     loop = asyncio.get_running_loop()
     http = StreamingServer(('', http_port), HttpHandler)
     stream = StreamingServer(('', stream_port), StreamingHandler)
@@ -944,7 +1063,13 @@ async def _run(
     pending = [*server_futures, stop_task]
     labels = ['http server', 'stream server', 'stop signal']
     watchdog_task = None
-    if watchdog_enabled:
+    if camera_probe:
+        # Degraded mode: no frames will ever arrive, so a frame watchdog would
+        # only trigger pointless restarts — watch for the camera instead.
+        watchdog_task = asyncio.create_task(_camera_probe())
+        pending.append(watchdog_task)
+        labels.append('camera probe')
+    elif watchdog_enabled:
         watchdog_task = asyncio.create_task(
             watchdog(
                 frame_buffer,
