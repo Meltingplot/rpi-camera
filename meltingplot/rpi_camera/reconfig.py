@@ -16,6 +16,11 @@ pump is therefore started once and kept running across reconfigures.
 The work runs on a dedicated worker thread fed by a coalescing queue, so
 the HTTP control handler that triggered the change returns immediately
 instead of blocking for the seconds a pipeline reconfigure takes.
+
+While no consumer is streaming (no HTTP MJPEG client, no UVC host) the
+coordinator drops the frame rate to ``idle_fps`` (default 1) to save CPU and
+heat; the first consumer restores the configured rate. Capture never stops —
+the frame-stall watchdog keeps observing frames either way.
 """
 
 import logging
@@ -35,6 +40,11 @@ log = logging.getLogger(__name__)
 # duration limits are microseconds: (min = 30 fps, max = 1 fps). Without a
 # wide range here picamera2 picks a sensor mode that clamps low frame rates.
 FRAME_DURATION_LIMITS = (33333, 1000000)
+
+# Queue sentinel enqueued on consumer count transitions (first consumer
+# arrived / last consumer left): the worker re-applies the effective frame
+# rate — a live control, no pipeline reconfigure.
+_IDLE_UPDATE = object()
 
 
 def parse_resolution(value, fallback):
@@ -57,12 +67,20 @@ class ReconfigCoordinator:
     changes are ignored.
     """
 
-    def __init__(self, picam2, frame_buffer, *, autofocus, enable_uvc):
-        """Bind dependencies and start the reconfigure worker thread."""
+    def __init__(self, picam2, frame_buffer, *, autofocus, enable_uvc, idle_fps=1):
+        """Bind dependencies and start the reconfigure worker thread.
+
+        ``idle_fps`` is the frame rate applied while no consumer (HTTP MJPEG
+        client or UVC host) is streaming — capture never stops entirely, the
+        frame-stall watchdog needs frames. 0 disables idle throttling.
+        """
         self._picam2 = picam2
         self._frame_buffer = frame_buffer
         self._autofocus = autofocus
         self._enable_uvc = enable_uvc
+        self._idle_fps = idle_fps
+        self._consumers = 0
+        self._consumer_lock = threading.Lock()
         self._controller = None
         self._lock = threading.RLock()
         self._pump = None
@@ -88,6 +106,42 @@ class ReconfigCoordinator:
         """Run the initial synchronous configure + record + gadget + pump."""
         with self._lock:
             self._reconfigure(width, height, framerate, force=True)
+
+    # -- idle frame-rate throttling ------------------------------------
+    def consumer_added(self):
+        """Register a stream consumer (HTTP MJPEG client or UVC host).
+
+        The first consumer restores the configured frame rate.
+        """
+        with self._consumer_lock:
+            self._consumers += 1
+            first = self._consumers == 1
+        if first and self._idle_fps:
+            self._queue.put(_IDLE_UPDATE)
+
+    def consumer_removed(self):
+        """Unregister a stream consumer; the last one leaving drops to idle fps."""
+        with self._consumer_lock:
+            self._consumers = max(0, self._consumers - 1)
+            last = self._consumers == 0
+        if last and self._idle_fps:
+            self._queue.put(_IDLE_UPDATE)
+
+    def _effective_fps(self, fps):
+        """Frame rate to actually apply: idle fps while nobody is streaming."""
+        if not self._idle_fps:
+            return fps
+        with self._consumer_lock:
+            idle = self._consumers == 0
+        return min(self._idle_fps, fps) if idle else fps
+
+    def _apply_effective_framerate(self):
+        """Re-apply the frame rate after a consumer count transition."""
+        if self._fps is None:
+            return  # nothing configured yet; bring_up applies the right rate
+        fps = self._effective_fps(self._fps)
+        log.info('Consumer change: frame rate -> %d fps (configured %d)', fps, self._fps)
+        self._set_framerate(fps)
 
     def on_change(self, merged_state, changed):
         """Enqueue a Resolution/FrameRate/Rotation change for the worker (returns at once)."""
@@ -126,6 +180,11 @@ class ReconfigCoordinator:
         """Toggle host ownership and notify listeners when the host opens/closes the stream."""
         self._host_streaming = active
         log.info('USB host UVC stream %s', 'started' if active else 'stopped')
+        # The host counts as a consumer for idle throttling.
+        if active:
+            self.consumer_added()
+        else:
+            self.consumer_removed()
         if self._stream_listener is not None:
             try:
                 self._stream_listener(active)
@@ -146,19 +205,38 @@ class ReconfigCoordinator:
                 self._recording = False
 
     # -- worker --------------------------------------------------------
+    def _coalesce(self, item):
+        """Drain the queue down to the newest reconfigure target.
+
+        Only the most recent target matters, but ``force`` stays set if ANY
+        coalesced request needs it (e.g. a rotation change whose
+        resolution/fps are unchanged would otherwise be skipped). Idle-update
+        sentinels drained here are subsumed: the following ``_reconfigure``
+        applies the effective (idle-aware) frame rate anyway.
+        """
+        force = item[3]
+        while not self._queue.empty():
+            try:
+                nxt = self._queue.get_nowait()
+            except queue.Empty:
+                break
+            if nxt is _IDLE_UPDATE:
+                continue
+            item = nxt
+            force = force or item[3]
+        return item, force
+
     def _worker_loop(self):
         while True:
             item = self._queue.get()
-            force = item[3]
-            # Coalesce: only the most recent target matters, but keep force set
-            # if ANY coalesced request needs it (e.g. a rotation change whose
-            # resolution/fps are unchanged would otherwise be skipped).
-            while not self._queue.empty():
+            if item is _IDLE_UPDATE:
                 try:
-                    item = self._queue.get_nowait()
-                    force = force or item[3]
-                except queue.Empty:
-                    break
+                    with self._lock:
+                        self._apply_effective_framerate()
+                except Exception:
+                    log.exception('Idle frame rate update failed')
+                continue
+            item, force = self._coalesce(item)
             width, height, fps = item[0], item[1], item[2]
             try:
                 with self._lock:
@@ -191,7 +269,7 @@ class ReconfigCoordinator:
             self._apply_camera_controls(fps)
         else:
             # fps-only change: a live control, no pipeline restart needed.
-            self._set_framerate(fps)
+            self._set_framerate(self._effective_fps(fps))
 
         self._width, self._height, self._fps = width, height, fps
 
@@ -212,7 +290,7 @@ class ReconfigCoordinator:
                 log.warning('Autofocus not supported, continuing without: %s', exc)
         if self._controller is not None:
             self._controller.reapply_live()
-        self._set_framerate(fps)
+        self._set_framerate(self._effective_fps(fps))
 
     def _set_framerate(self, fps):
         try:

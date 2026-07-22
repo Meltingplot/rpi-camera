@@ -240,6 +240,10 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
     # Error string set when the server runs degraded because no camera was
     # detected at startup; the stream then answers 503 instead of stalling.
     camera_error = None
+    # ReconfigCoordinator notified when MJPEG clients connect/disconnect so it
+    # can drop the capture frame rate while nobody is streaming. None in
+    # degraded mode (no camera) — nothing to throttle then.
+    coordinator = None
 
     def do_GET(self):  # noqa:N802
         """Serve the MJPEG stream."""
@@ -251,13 +255,16 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
             if _host_active(self.host_streaming):
                 self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
                 return
-            self.send_response(200)
-            self.send_header('Age', 0)
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
-            self.end_headers()
+            coordinator = self.coordinator
+            if coordinator is not None:
+                coordinator.consumer_added()
             try:
+                self.send_response(200)
+                self.send_header('Age', 0)
+                self.send_header('Cache-Control', 'no-cache, private')
+                self.send_header('Pragma', 'no-cache')
+                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+                self.end_headers()
                 while True:
                     with self.frame_buffer.condition:
                         if not self.frame_buffer.condition.wait(timeout=5):
@@ -278,6 +285,9 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
                     self.wfile.write(b'\r\n')
             except Exception as e:
                 logging.warning('Removed streaming client %s: %s', self.client_address, str(e))
+            finally:
+                if coordinator is not None:
+                    coordinator.consumer_removed()
         else:
             self.send_error(404)
             self.end_headers()
@@ -727,6 +737,17 @@ def _default_resolution(model=None):
     'plus the HTTP and USB-UVC fan-out saturates the low-end Pi boards.',
 )
 @click.option(
+    '--idle-framerate',
+    type=int,
+    envvar='RPI_CAMERA_IDLE_FRAMERATE',
+    default=1,
+    show_default=True,
+    help='Frame rate while no MJPEG client and no USB (UVC) host is streaming. '
+    'Capture keeps running (the frame watchdog needs frames) but CPU load and '
+    'heat drop; the first consumer restores the configured rate. 0 disables '
+    'idle throttling.',
+)
+@click.option(
     '--http-port',
     type=int,
     default=80,
@@ -807,6 +828,7 @@ def start(
     width,
     height,
     framerate,
+    idle_framerate,
     http_port,
     stream_port,
     autofocus,
@@ -839,6 +861,8 @@ def start(
     if height is None:
         height = default_height
     logging.info('Capture resolution: %dx%d @ %d fps', width, height, framerate)
+    if idle_framerate:
+        logging.info('Idle frame rate while no client streams: %d fps', idle_framerate)
 
     frame_buffer = StreamingOutput(rotation=int(rotation))
     HttpHandler.frame_buffer = frame_buffer
@@ -890,10 +914,14 @@ def start(
         frame_buffer,
         autofocus=autofocus,
         enable_uvc=enable_uvc,
+        idle_fps=idle_framerate,
     )
     coordinator.set_controller(controller)
     controller.register_change_listener(coordinator.on_change)
     HttpHandler.controller = controller
+    # Let the stream handler report connecting/disconnecting MJPEG clients so
+    # the coordinator can throttle the frame rate while nobody is streaming.
+    StreamingHandler.coordinator = coordinator
 
     # When a USB host opens the UVC stream it owns the camera: the HTTP stream
     # and control writes yield to it (the UI greys out with a hint). The pump
