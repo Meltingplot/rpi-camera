@@ -139,6 +139,7 @@
   </h1>
   <div class="links">
     <a id="streamLink" href="" target="_blank">Stream URL</a>
+    <a id="altStreamLink" href="" target="_blank">Stream URL (alt port)</a>
     <a href="/picture/1/current/" target="_blank">Snapshot</a>
   </div>
 </header>
@@ -163,13 +164,19 @@
 (function() {
   const STREAM_PORT = '__STREAM_PORT__';
   const streamLink = document.getElementById('streamLink');
+  const altStreamLink = document.getElementById('altStreamLink');
   const streamImg = document.getElementById('stream');
   const root = document.getElementById('controls-root');
   const toast = document.getElementById('toast');
 
-  const streamUrl = `http://${window.location.hostname}:${STREAM_PORT}/`;
+  // Same-origin stream: whatever port reached this page also serves /webcam.
+  // Corporate networks usually route only :80 across VLANs, so the stream must
+  // not depend on the custom stream port being reachable.
+  const streamUrl = '/webcam';
   streamLink.href = streamUrl;
   streamImg.src = streamUrl;
+  altStreamLink.href = `http://${window.location.hostname}:${STREAM_PORT}/`;
+  altStreamLink.textContent = `Stream URL :${STREAM_PORT}`;
 
   const GROUPS = [
     ['exposure', 'Exposure'],

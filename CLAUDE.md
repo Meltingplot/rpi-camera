@@ -32,8 +32,10 @@ Run the server locally (requires a real Pi camera): `rpi-camera start`. Install 
 
 **Streaming server** ([server.py](meltingplot/rpi_camera/server.py)). Single process binds **two** HTTP servers concurrently:
 
-- Port **80** (`HttpHandler`): serves the landing HTML page and a single-frame JPEG snapshot at `/snapshot` and `/picture/1/current/`. Binding port 80 unprivileged requires `CAP_NET_BIND_SERVICE`, set in `rpi-camera.service`.
+- Port **80** (`HttpHandler`): serves the landing HTML page, the JSON control API, a single-frame JPEG snapshot at `/snapshot` and `/picture/1/current/`, **and** the MJPEG stream at `/webcam` or `/stream`. Binding port 80 unprivileged requires `CAP_NET_BIND_SERVICE`, set in `rpi-camera.service`.
 - Port **8081** (`StreamingHandler`): serves the continuous MJPEG `multipart/x-mixed-replace` stream at `/` or `/webcam`.
+
+The stream is served on **both** ports on purpose: corporate networks routinely route only :80 across VLAN boundaries (printer VLAN → office VLAN), so a camera reachable from the office at all is reachable there on port 80 only. The shared serving loop lives in `_MjpegStreamMixin._serve_mjpeg`, mixed into both handlers. Because every MJPEG client holds a worker thread for the whole stream, `HttpHandler.stream_slots` (a `Semaphore(8)`, vs. the server-wide `max_clients = 16`) caps streams on port 80 so they can never starve the landing page, snapshots or the control API — extra stream clients get a 503 there and can still use 8081. The landing page points its `<img>` and its Stream URL link at the same-origin `/webcam` for the same reason, and offers the `:8081` URL as a secondary link.
 
 Both handlers share a single `StreamingOutput` (`frame_buffer`) attached as a class attribute. Picamera2 writes MJPEG frames into it via `FileOutput`; handlers `condition.wait(timeout=5)` on a new frame and then write it to the client (timeout disconnects the client / returns 503 on snapshot if the camera stalls). Rotation handling is hybrid: 0°/180° is done at the sensor via `Transform(hflip, vflip)` (free — see `StreamingOutput.hw_transform`), 90°/270° fall back to a client-side EXIF Orientation tag injected by `StreamingOutput.write` (`piexif`).
 

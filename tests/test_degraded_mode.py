@@ -116,6 +116,13 @@ def test_stream_returns_503(degraded_servers):
     assert status == 503
 
 
+def test_stream_on_http_port_returns_503(degraded_servers):
+    """The stream mirrored onto port 80 refuses too, instead of stalling."""
+    http_port, _ = degraded_servers
+    status, _ = _get('http://127.0.0.1:%d/webcam' % http_port)
+    assert status == 503
+
+
 def test_camera_probe_waits_then_returns_on_detection():
     """The probe loops while no camera is present and returns once one appears."""
 

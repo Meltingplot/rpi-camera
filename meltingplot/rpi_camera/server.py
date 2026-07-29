@@ -21,6 +21,9 @@ HTML Page:
     stream view and a control panel that talks to /api/controls.
 Endpoints (port 80):
     / or /index.html: Serves the HTML page.
+    /webcam or /stream: Serves the MJPEG stream (same stream as port 8081 —
+        available here because corporate networks commonly route only :80
+        between VLANs, e.g. printer VLAN to office VLAN).
     /picture/1/current/ or /snapshot: Serves the current frame as a JPEG image.
     GET /api/controls: Returns curated capabilities and currently applied state (plus host_active).
     POST /api/controls: Applies a partial control dict, persists it to JSON.
@@ -79,7 +82,8 @@ _FALLBACK_PAGE = """\
 <h1>Meltingplot RPi Camera</h1>
 <img src="data:image/png;base64,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" width=160 height=66></img>
 <p><a href="picture/1/current/">Screenshot URL</a> <span>picture/1/current/</span></p>
-<p><a id="streamLink" href="">Stream URL</a> <span>Streaming URL hostname:__STREAM_PORT__</span></p>
+<p><a href="webcam">Stream URL</a> <span>/webcam</span></p>
+<p><a id="streamLink" href="">Stream URL (alt port)</a> <span>Streaming URL hostname:__STREAM_PORT__</span></p>
 <script type="text/javascript">
     document.addEventListener("DOMContentLoaded", function() {
         var hostname = window.location.hostname;
@@ -230,8 +234,14 @@ _CAPTIVE_PROBE_PATHS = {
 }
 
 
-class StreamingHandler(server.BaseHTTPRequestHandler):
-    """A request handler for serving the MJPEG stream."""
+class _MjpegStreamMixin:
+    """Serves the MJPEG ``multipart/x-mixed-replace`` stream.
+
+    Shared by both handlers: the stream is available on the dedicated stream
+    port *and* on the HTTP port (``/webcam``). Corporate networks routinely
+    route only :80 between VLANs, so a camera on the printer VLAN is reachable
+    from the office VLAN on port 80 only — the custom stream port is not.
+    """
 
     frame_buffer = None
     # threading.Event set while a USB host streams the camera as a UVC webcam.
@@ -244,75 +254,88 @@ class StreamingHandler(server.BaseHTTPRequestHandler):
     # can drop the capture frame rate while nobody is streaming. None in
     # degraded mode (no camera) — nothing to throttle then.
     coordinator = None
+    # Optional Semaphore capping concurrent MJPEG clients for this handler
+    # class. None = only the server-wide max_clients cap applies.
+    stream_slots = None
+
+    def _serve_mjpeg(self):
+        """Stream frames until the client disconnects, the camera stalls, or a host takes over."""
+        if self.camera_error:
+            self.send_error(503, 'No camera detected')
+            return
+        if _host_active(self.host_streaming):
+            self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
+            return
+        slots = self.stream_slots
+        if slots is not None and not slots.acquire(blocking=False):
+            logging.warning('Refusing stream client %s: stream slots exhausted', self.client_address)
+            self.send_error(503, 'Too many stream clients')
+            return
+        coordinator = self.coordinator
+        if coordinator is not None:
+            coordinator.consumer_added()
+        try:
+            self.send_response(200)
+            self.send_header('Age', 0)
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
+            self.end_headers()
+            while True:
+                with self.frame_buffer.condition:
+                    if not self.frame_buffer.condition.wait(timeout=5):
+                        # Camera stalled — drop the client so the thread can exit
+                        # rather than blocking forever. Watchdog will reboot if needed.
+                        logging.warning('No frame within timeout, disconnecting %s', self.client_address)
+                        break
+                    frame = self.frame_buffer.frame
+                if _host_active(self.host_streaming):
+                    # A USB host just took over the camera — drop the client.
+                    logging.info('USB host took over; disconnecting stream client %s', self.client_address)
+                    break
+                self.wfile.write(b'--FRAME\r\n')
+                self.send_header('Content-Type', 'image/jpeg')
+                self.send_header('Content-Length', len(frame))
+                self.end_headers()
+                self.wfile.write(frame)
+                self.wfile.write(b'\r\n')
+        except Exception as e:
+            logging.warning('Removed streaming client %s: %s', self.client_address, str(e))
+        finally:
+            if coordinator is not None:
+                coordinator.consumer_removed()
+            if slots is not None:
+                slots.release()
+
+
+class StreamingHandler(_MjpegStreamMixin, server.BaseHTTPRequestHandler):
+    """A request handler for serving the MJPEG stream."""
 
     def do_GET(self):  # noqa:N802
         """Serve the MJPEG stream."""
         url = urlparse(self.path)
         if url.path in ('/', '/webcam'):
-            if self.camera_error:
-                self.send_error(503, 'No camera detected')
-                return
-            if _host_active(self.host_streaming):
-                self.send_error(503, 'Camera is in use as a USB (UVC) webcam')
-                return
-            coordinator = self.coordinator
-            if coordinator is not None:
-                coordinator.consumer_added()
-            try:
-                self.send_response(200)
-                self.send_header('Age', 0)
-                self.send_header('Cache-Control', 'no-cache, private')
-                self.send_header('Pragma', 'no-cache')
-                self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=FRAME')
-                self.end_headers()
-                while True:
-                    with self.frame_buffer.condition:
-                        if not self.frame_buffer.condition.wait(timeout=5):
-                            # Camera stalled — drop the client so the thread can exit
-                            # rather than blocking forever. Watchdog will reboot if needed.
-                            logging.warning('No frame within timeout, disconnecting %s', self.client_address)
-                            break
-                        frame = self.frame_buffer.frame
-                    if _host_active(self.host_streaming):
-                        # A USB host just took over the camera — drop the client.
-                        logging.info('USB host took over; disconnecting stream client %s', self.client_address)
-                        break
-                    self.wfile.write(b'--FRAME\r\n')
-                    self.send_header('Content-Type', 'image/jpeg')
-                    self.send_header('Content-Length', len(frame))
-                    self.end_headers()
-                    self.wfile.write(frame)
-                    self.wfile.write(b'\r\n')
-            except Exception as e:
-                logging.warning('Removed streaming client %s: %s', self.client_address, str(e))
-            finally:
-                if coordinator is not None:
-                    coordinator.consumer_removed()
+            self._serve_mjpeg()
         else:
             self.send_error(404)
             self.end_headers()
 
 
-class HttpHandler(server.BaseHTTPRequestHandler):
-    """A request handler for the HTML page, snapshots, and the JSON control API."""
+class HttpHandler(_MjpegStreamMixin, server.BaseHTTPRequestHandler):
+    """A request handler for the HTML page, the MJPEG stream, snapshots, and the JSON control API."""
 
-    frame_buffer = None
     # Pre-rendered landing page bytes; templated with the stream port at start time.
     page_bytes = None
     # CameraController instance shared across handler threads. None means the
     # control API endpoints respond 503 (camera initialised without controls).
     controller = None
-    # threading.Event set while a USB host streams the camera as a UVC webcam.
-    # While set, the host owns the camera: snapshots and control writes are
-    # refused and the UI greys out (the host drives controls over UVC).
-    host_streaming = None
-    # Error string set when the server runs degraded because no camera was
-    # detected at startup; page_bytes then holds the explanatory error page.
-    camera_error = None
 
-    # The MJPEG hot path lives on a separate StreamingServer (port 8081) and
-    # never goes through this handler — so the JSON control endpoints below
-    # cannot starve frame delivery, even under POST flood.
+    # Each MJPEG client on this port holds a worker thread for the whole stream
+    # duration, so cap them well below the server's max_clients — the remaining
+    # threads stay available for the landing page, snapshots and the control
+    # API, which must not be starved by streaming clients (and vice versa: the
+    # dedicated stream port is unaffected by whatever happens here).
+    stream_slots = Semaphore(8)
 
     def _serve_snapshot(self):
         """Serve the current frame as a single JPEG (refused while a host streams)."""
@@ -373,6 +396,10 @@ class HttpHandler(server.BaseHTTPRequestHandler):
             )
         elif url.path in ('/picture/1/current/', '/snapshot'):
             self._serve_snapshot()
+        elif url.path in ('/webcam', '/stream'):
+            # Same MJPEG stream as the dedicated stream port, served on :80 so
+            # it survives VLAN routing that only forwards HTTP.
+            self._serve_mjpeg()
         elif url.path == '/api/controls':
             if self.controller is None:
                 self.send_error(503, 'Controls unavailable')
@@ -919,9 +946,11 @@ def start(
     coordinator.set_controller(controller)
     controller.register_change_listener(coordinator.on_change)
     HttpHandler.controller = controller
-    # Let the stream handler report connecting/disconnecting MJPEG clients so
-    # the coordinator can throttle the frame rate while nobody is streaming.
+    # Let both stream-serving handlers report connecting/disconnecting MJPEG
+    # clients so the coordinator can throttle the frame rate while nobody is
+    # streaming (the stream is served on the HTTP port as well).
     StreamingHandler.coordinator = coordinator
+    HttpHandler.coordinator = coordinator
 
     # When a USB host opens the UVC stream it owns the camera: the HTTP stream
     # and control writes yield to it (the UI greys out with a hint). The pump
