@@ -29,7 +29,8 @@ Endpoints (port 80):
     POST /api/controls: Applies a partial control dict, persists it to JSON.
     POST /api/controls/reset: Restores every control to its sensor default.
     POST /api/autofocus: Runs a one-shot autofocus cycle.
-    GET /api/status: Reports whether a USB host currently owns the camera (UVC).
+    GET /api/status: Reports whether a USB host currently owns the camera (UVC),
+        plus the frame counter and a monotonic timestamp the UI turns into an FPS readout.
 While a USB host streams the camera as a UVC webcam it owns the device: the
 MJPEG stream and snapshot return 503, control writes return 409, and the web
 UI greys out — resuming automatically once the host stops streaming.
@@ -387,11 +388,16 @@ class HttpHandler(_MjpegStreamMixin, server.BaseHTTPRequestHandler):
         elif url.path == '/api/status':
             # Cheap endpoint the UI polls to learn when the host owns the
             # camera; the degraded no-camera page polls it to reload itself.
+            # ``frames``/``time`` let the UI derive the live frame rate from the
+            # delta between two polls, so the FPS readout stays a page overlay
+            # instead of being burned into the JPEG frames.
             self._send_json(
                 200,
                 {
                     'host_active': _host_active(self.host_streaming),
                     'camera_error': self.camera_error,
+                    'frames': self.frame_buffer.frame_counter,
+                    'time': time.monotonic(),
                 },
             )
         elif url.path in ('/picture/1/current/', '/snapshot'):

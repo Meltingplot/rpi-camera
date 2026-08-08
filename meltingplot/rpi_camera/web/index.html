@@ -44,7 +44,22 @@
     background: #000;
     display: flex; align-items: center; justify-content: center;
     overflow: hidden;
+    position: relative;  /* anchor for the FPS badge */
   }
+  /* FPS readout: a page overlay on top of the <img>, never composited into
+     the MJPEG frames — the stream stays a clean camera image for any other
+     consumer (snapshot, UVC host, recording). */
+  #fps-badge {
+    position: absolute; top: 10px; left: 10px;
+    padding: 3px 8px; border-radius: 4px;
+    background: rgba(0, 0, 0, 0.55);
+    border: 1px solid var(--border);
+    color: var(--text); font-size: 12px; font-weight: 600;
+    font-variant-numeric: tabular-nums;
+    pointer-events: none;
+    opacity: 0; transition: opacity 0.2s;
+  }
+  #fps-badge.show { opacity: 1; }
   #stream {
     width: 100%; height: 100%; object-fit: contain;
   }
@@ -128,6 +143,7 @@
      (now unavailable) live stream, and grey the controls out. */
   body.host-active #host-banner { display: block; }
   body.host-active #stream { display: none; }
+  body.host-active #fps-badge { display: none; }
   body.host-active #stream-overlay { display: block; }
   body.host-active #controls-pane { opacity: 0.45; pointer-events: none; }
 </style>
@@ -149,6 +165,7 @@
 <main>
   <div id="stream-pane">
     <img id="stream" alt="Live MJPEG stream">
+    <div id="fps-badge" title="Live capture frame rate">– fps</div>
     <div id="stream-overlay">
       <strong>Camera in use as a USB (UVC) webcam.</strong><br>
       The connected host controls the live view and camera settings.
@@ -479,13 +496,42 @@
     }
   }
 
+  // FPS is derived from the server-side frame counter (frames captured between
+  // two /api/status polls, over the server's own monotonic clock) rather than
+  // measured in the browser — an <img> fed by multipart/x-mixed-replace gives
+  // no reliable per-frame event, and the counter is the rate the camera really
+  // produces. The value is only ever rendered into #fps-badge; the JPEG frames
+  // themselves stay untouched.
+  const fpsBadge = document.getElementById('fps-badge');
+  let lastFrames = null;
+  let lastTime = null;
+
+  function updateFps(frames, time) {
+    if (typeof frames !== 'number' || typeof time !== 'number') return;
+    if (lastTime !== null && time > lastTime && frames >= lastFrames) {
+      const fps = (frames - lastFrames) / (time - lastTime);
+      fpsBadge.textContent = (fps >= 10 ? fps.toFixed(0) : fps.toFixed(1)) + ' fps';
+      fpsBadge.classList.add('show');
+    }
+    lastFrames = frames;
+    lastTime = time;
+  }
+
   function pollStatus() {
     fetch('/api/status')
       .then(r => r.json())
-      .then(d => applyHostActive(!!d.host_active))
-      .catch(() => {});
+      .then(d => {
+        applyHostActive(!!d.host_active);
+        updateFps(d.frames, d.time);
+      })
+      .catch(() => {
+        // Server unreachable — drop the stale reading instead of showing it.
+        fpsBadge.classList.remove('show');
+        lastTime = null;
+      });
   }
   setInterval(pollStatus, 2000);
+  pollStatus();
 
   refresh();
 })();
