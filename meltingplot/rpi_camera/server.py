@@ -40,6 +40,10 @@ and stream return 503, and a background probe exits the process for a clean
 systemd restart as soon as libcamera reports a camera again.
 Endpoints (port 8081):
     / or /webcam: Serves the MJPEG stream.
+Embedding in another website:
+    ``--cors-origin`` (RPI_CAMERA_CORS_ORIGIN) adds the CORS response headers
+    every response needs before a foreign page may *read* the stream — e.g.
+    draw it into a <canvas>. Plain <iframe>/<img> embedding works without it.
 Usage:
     Run the script to start the HTTP servers on ports 80 and 8081.
 """
@@ -235,6 +239,108 @@ _CAPTIVE_PROBE_PATHS = {
 }
 
 
+def _parse_cors_origins(value):
+    """Normalise the ``--cors-origin`` value into a tuple of allowed origins.
+
+    Accepts a comma-separated list ('https://a.example, https://b.example') or
+    the wildcard '*'. Origins are lower-cased and stripped of a trailing slash
+    so they compare equal to the scheme+host+port form browsers put in the
+    ``Origin`` request header. An empty/absent value disables CORS entirely.
+    """
+    if not value:
+        return ()
+    origins = []
+    for item in value.split(','):
+        item = item.strip().rstrip('/')
+        if item:
+            origins.append(item if item == '*' else item.lower())
+    return tuple(origins)
+
+
+class _CorsMixin:
+    """Adds the CORS response headers that let another site embed the stream.
+
+    A plain ``<iframe>`` or ``<img>`` on a foreign page already works — this
+    server sends neither ``X-Frame-Options`` nor a ``frame-ancestors`` CSP.
+    What browsers block without CORS is *reading* the pixels: drawing the
+    cross-origin stream into a ``<canvas>`` taints the canvas, and
+    ``getImageData()``/``toDataURL()`` then throw. ``Access-Control-Allow-
+    Origin`` (with the embedder loading the stream as
+    ``<img crossorigin="anonymous">``) makes those reads legal, and also
+    unlocks ``fetch()`` against ``/snapshot`` and the ``/api`` endpoints.
+
+    ``Cross-Origin-Resource-Policy: cross-origin`` rides along so the stream
+    still loads on pages that opt into cross-origin isolation
+    (``Cross-Origin-Embedder-Policy: require-corp``), which otherwise drops
+    every cross-origin subresource that does not carry it.
+
+    Off by default (``cors_origins`` empty): no header is added at all, so
+    responses stay byte-for-byte what they were.
+    """
+
+    # Allowed origins from --cors-origin / RPI_CAMERA_CORS_ORIGIN, or ('*',).
+    cors_origins = ()
+
+    def _allowed_origin(self):
+        """Return the ``Access-Control-Allow-Origin`` value for this request, or None."""
+        origins = self.cors_origins
+        if not origins:
+            return None
+        if '*' in origins:
+            return '*'
+        # ``headers`` is unset when the request line itself failed to parse and
+        # BaseHTTPRequestHandler is already on its way to a 400.
+        headers = getattr(self, 'headers', None)
+        origin = headers.get('Origin') if headers else None
+        if origin and origin.strip().rstrip('/').lower() in origins:
+            # Echo the caller's own origin: the allow-list form of the header
+            # carries a single origin, never a list.
+            return origin
+        return None
+
+    def _allowed_methods(self):
+        """Return the methods this handler actually serves (the stream port is GET-only)."""
+        return 'GET, POST, OPTIONS' if hasattr(self, 'do_POST') else 'GET, OPTIONS'
+
+    def send_response(self, *args, **kwargs):
+        """Send the status line and default headers, followed by the CORS headers.
+
+        Hooking ``send_response`` covers every response in one place — the
+        landing page, snapshots, the JSON API, the stream's own 200 and the
+        errors ``send_error`` produces. The per-part headers inside the
+        multipart body go through ``send_header`` directly and stay untouched.
+        """
+        super().send_response(*args, **kwargs)
+        origins = self.cors_origins
+        if not origins:
+            return
+        if '*' not in origins:
+            # The response differs per requesting origin — whether or not this
+            # one is allowed — so keep caches from handing one site's copy to
+            # another.
+            self.send_header('Vary', 'Origin')
+        allow_origin = self._allowed_origin()
+        if allow_origin is None:
+            return
+        self.send_header('Access-Control-Allow-Origin', allow_origin)
+        self.send_header('Cross-Origin-Resource-Policy', 'cross-origin')
+
+    def do_OPTIONS(self):  # noqa:N802
+        """Answer the preflight a browser sends before a cross-origin control POST."""
+        if self._allowed_origin() is None:
+            self.send_response(405)
+            self.send_header('Allow', self._allowed_methods())
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+            return
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Methods', self._allowed_methods())
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type')
+        self.send_header('Access-Control-Max-Age', '86400')
+        self.send_header('Content-Length', '0')
+        self.end_headers()
+
+
 class _MjpegStreamMixin:
     """Serves the MJPEG ``multipart/x-mixed-replace`` stream.
 
@@ -309,7 +415,7 @@ class _MjpegStreamMixin:
                 slots.release()
 
 
-class StreamingHandler(_MjpegStreamMixin, server.BaseHTTPRequestHandler):
+class StreamingHandler(_MjpegStreamMixin, _CorsMixin, server.BaseHTTPRequestHandler):
     """A request handler for serving the MJPEG stream."""
 
     def do_GET(self):  # noqa:N802
@@ -322,7 +428,7 @@ class StreamingHandler(_MjpegStreamMixin, server.BaseHTTPRequestHandler):
             self.end_headers()
 
 
-class HttpHandler(_MjpegStreamMixin, server.BaseHTTPRequestHandler):
+class HttpHandler(_MjpegStreamMixin, _CorsMixin, server.BaseHTTPRequestHandler):
     """A request handler for the HTML page, the MJPEG stream, snapshots, and the JSON control API."""
 
     # Pre-rendered landing page bytes; templated with the stream port at start time.
@@ -850,6 +956,16 @@ def _default_resolution(model=None):
     'No-op on boards/images without the gadget configured.',
 )
 @click.option(
+    '--cors-origin',
+    envvar='RPI_CAMERA_CORS_ORIGIN',
+    default=None,
+    help='Let these browser origins read the stream, snapshot and control API '
+    'cross-origin (Access-Control-Allow-Origin). Comma-separated list, e.g. '
+    '"https://ops.example.com,https://print.example.com", or "*" for any origin. '
+    'Off by default. Embedding the stream in an <iframe> or <img> needs no CORS; '
+    'drawing it into a <canvas> does (load it with crossorigin="anonymous").',
+)
+@click.option(
     '--log-level',
     type=click.Choice(['DEBUG', 'INFO', 'WARNING', 'ERROR'], case_sensitive=False),
     default='INFO',
@@ -872,6 +988,7 @@ def start(
     watchdog,
     controls_file,
     enable_uvc,
+    cors_origin,
     log_level,
 ):
     """
@@ -901,6 +1018,12 @@ def start(
     HttpHandler.frame_buffer = frame_buffer
     HttpHandler.page_bytes = _load_page_bytes(stream_port)
     StreamingHandler.frame_buffer = frame_buffer
+
+    cors_origins = _parse_cors_origins(cors_origin)
+    HttpHandler.cors_origins = cors_origins
+    StreamingHandler.cors_origins = cors_origins
+    if cors_origins:
+        logging.info('Cross-origin embedding allowed for: %s', ', '.join(cors_origins))
 
     try:
         picam2 = Picamera2()

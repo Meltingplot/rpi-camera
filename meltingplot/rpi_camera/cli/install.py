@@ -98,6 +98,15 @@ def _makedirs(path):
     "directory.",
 )
 @click.option(
+    '--cors-origin',
+    envvar='RPI_CAMERA_CORS_ORIGIN',
+    default=None,
+    help='Browser origins allowed to read the stream, snapshot and control API '
+    'cross-origin, baked into the systemd unit as RPI_CAMERA_CORS_ORIGIN. '
+    'Comma-separated list, or "*" for any origin. Off by default — needed only to '
+    'draw the stream into another site\'s <canvas>; see `rpi-camera start --help`.',
+)
+@click.option(
     '--configure-network',
     envvar='RPI_CAMERA_CONFIGURE_NETWORK',
     is_flag=True,
@@ -112,6 +121,7 @@ def install(
     service_user,
     service_group,
     working_directory,
+    cors_origin,
     configure_network,
 ):
     """Install the RPi Camera as a systemd service."""
@@ -145,6 +155,19 @@ def install(
         f'WorkingDirectory={working_dir}',
         1,
     )
+
+    # The unit starts `rpi-camera start` without arguments, so the environment is
+    # the only handle an operator has on its options — bake the allow-list in.
+    if cors_origin:
+        origins = ','.join(part.strip() for part in cors_origin.split(',') if part.strip())
+        if '\n' in origins or '"' in origins:
+            raise click.ClickException(f'Invalid --cors-origin value: {cors_origin!r}')
+        service_content = service_content.replace(
+            'ExecStart=',
+            f'Environment="RPI_CAMERA_CORS_ORIGIN={origins}"\nExecStart=',
+            1,
+        )
+        click.echo(f'Allowing cross-origin browser access from: {origins}')
 
     click.echo(f"Installing the service as user/group: {current_user}/{current_group}")
 

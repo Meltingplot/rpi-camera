@@ -37,6 +37,24 @@ Run the server locally (requires a real Pi camera): `rpi-camera start`. Install 
 
 The stream is served on **both** ports on purpose: corporate networks routinely route only :80 across VLAN boundaries (printer VLAN → office VLAN), so a camera reachable from the office at all is reachable there on port 80 only. The shared serving loop lives in `_MjpegStreamMixin._serve_mjpeg`, mixed into both handlers. Because every MJPEG client holds a worker thread for the whole stream, `HttpHandler.stream_slots` (a `Semaphore(8)`, vs. the server-wide `max_clients = 16`) caps streams on port 80 so they can never starve the landing page, snapshots or the control API — extra stream clients get a 503 there and can still use 8081. The landing page points its `<img>` and its Stream URL link at the same-origin `/webcam` for the same reason, and offers the `:8081` URL as a secondary link.
 
+**Cross-origin embedding.** `_CorsMixin` (mixed into both handlers) hooks
+`send_response`, so every response — landing page, snapshot, stream, JSON API,
+and the errors `send_error` produces — carries the CORS headers when
+`--cors-origin` / `RPI_CAMERA_CORS_ORIGIN` is set (comma-separated origin list,
+or `*`; off by default, and then no header is added at all). Hooking
+`send_response` rather than each endpoint is deliberate: the per-part headers
+inside the multipart body go through `send_header` directly and stay untouched.
+`Vary: Origin` is sent for every allow-list response (allowed or not) so caches
+cannot cross-serve; `Cross-Origin-Resource-Policy: cross-origin` rides along so
+the stream survives an embedder that sets `COEP: require-corp`. `do_OPTIONS`
+answers the preflight for cross-origin control POSTs (405 when CORS is off).
+This exists for `<canvas>` embedding — a cross-origin `<img>` taints the canvas
+and `getImageData()` throws — and for `fetch()` against `/snapshot` and `/api`;
+plain `<iframe>`/`<img>` embedding already works, since the server sends no
+`X-Frame-Options` and no `frame-ancestors` CSP. `rpi-camera install
+--cors-origin` bakes the value into the unit as an `Environment=` line, because
+the unit's `ExecStart` takes no arguments.
+
 Both handlers share a single `StreamingOutput` (`frame_buffer`) attached as a class attribute. Picamera2 writes MJPEG frames into it via `FileOutput`; handlers `condition.wait(timeout=5)` on a new frame and then write it to the client (timeout disconnects the client / returns 503 on snapshot if the camera stalls). Rotation handling is hybrid: 0°/180° is done at the sensor via `Transform(hflip, vflip)` (free — see `StreamingOutput.hw_transform`), 90°/270° fall back to a client-side EXIF Orientation tag injected by `StreamingOutput.write` (`piexif`).
 
 The two `StreamingServer`s (threaded `HTTPServer`s) are run via `loop.run_in_executor` (orchestrated by `_run()` under `asyncio.run`), alongside an async `watchdog` task. The whole process exits on `FIRST_COMPLETED`; the `finally` block then `shutdown()`/`server_close()`s both servers and cancels the watchdog, so any task failing tears the server down cleanly and lets systemd restart it.
