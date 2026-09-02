@@ -1019,11 +1019,7 @@ def start(
     HttpHandler.page_bytes = _load_page_bytes(stream_port)
     StreamingHandler.frame_buffer = frame_buffer
 
-    cors_origins = _parse_cors_origins(cors_origin)
-    HttpHandler.cors_origins = cors_origins
-    StreamingHandler.cors_origins = cors_origins
-    if cors_origins:
-        logging.info('Cross-origin embedding allowed for: %s', ', '.join(cors_origins))
+    _set_cors_origins(_parse_cors_origins(cors_origin))
 
     try:
         picam2 = Picamera2()
@@ -1074,6 +1070,9 @@ def start(
     )
     coordinator.set_controller(controller)
     controller.register_change_listener(coordinator.on_change)
+    # The CORS allow-list is editable from the web UI; a change lands on the
+    # handlers immediately and is persisted like any other control.
+    controller.register_server_listener(_server_control_listener)
     HttpHandler.controller = controller
     # Let both stream-serving handlers report connecting/disconnecting MJPEG
     # clients so the coordinator can throttle the frame rate while nobody is
@@ -1098,6 +1097,8 @@ def start(
         # controls — a saved Resolution/FrameRate triggers a reconfigure, the
         # rest are applied live (survives a watchdog reboot).
         controller.seed_reconfig_state('%dx%d' % (width, height), framerate, rotation=frame_buffer.rotation)
+        # Show the CLI/env allow-list in the UI; a persisted UI value wins below.
+        controller.seed_server_state(CorsOrigin=','.join(HttpHandler.cors_origins))
         controller.load_and_apply_persisted()
 
         asyncio.run(
@@ -1114,6 +1115,23 @@ def start(
         )
     finally:
         coordinator.stop()
+
+
+def _set_cors_origins(origins):
+    """Point both request handlers at a new cross-origin allow-list.
+
+    Called at startup with the --cors-origin value and again whenever the web
+    UI changes it, so the setting takes effect without a restart.
+    """
+    HttpHandler.cors_origins = origins
+    StreamingHandler.cors_origins = origins
+    logging.info('Cross-origin embedding allowed for: %s', ', '.join(origins) or '(nobody)')
+
+
+def _server_control_listener(name, value):
+    """Apply a SERVER control changed in the web UI to the running server."""
+    if name == 'CorsOrigin':
+        _set_cors_origins(_parse_cors_origins(value))
 
 
 def _package_version():

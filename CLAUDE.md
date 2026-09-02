@@ -53,7 +53,10 @@ and `getImageData()` throws — and for `fetch()` against `/snapshot` and `/api`
 plain `<iframe>`/`<img>` embedding already works, since the server sends no
 `X-Frame-Options` and no `frame-ancestors` CSP. `rpi-camera install
 --cors-origin` bakes the value into the unit as an `Environment=` line, because
-the unit's `ExecStart` takes no arguments.
+the unit's `ExecStart` takes no arguments. The allow-list is also editable from
+the web UI as the `CorsOrigin` control (see below); a value saved there wins
+over the CLI/env one, which is only seeded into the UI via
+`seed_server_state`.
 
 Both handlers share a single `StreamingOutput` (`frame_buffer`) attached as a class attribute. Picamera2 writes MJPEG frames into it via `FileOutput`; handlers `condition.wait(timeout=5)` on a new frame and then write it to the client (timeout disconnects the client / returns 503 on snapshot if the camera stalls). Rotation handling is hybrid: 0°/180° is done at the sensor via `Transform(hflip, vflip)` (free — see `StreamingOutput.hw_transform`), 90°/270° fall back to a client-side EXIF Orientation tag injected by `StreamingOutput.write` (`piexif`).
 
@@ -62,6 +65,24 @@ The two `StreamingServer`s (threaded `HTTPServer`s) are run via `loop.run_in_exe
 **Watchdog → reboot.** `watchdog()` polls `frame_buffer.frame_counter` every 2s after an initial 30s grace period (the grace period is load-bearing — without it a slow-to-init camera triggers an immediate reboot loop). If no new frame arrived since the last tick it calls `os.system("sudo reboot")`. This is intentional: a hung camera should reboot the Pi, not just restart the service.
 
 **Network-loss → reboot.** `reboot_on_wifi_disconnect.sh` is installed as a separate systemd service by `rpi-camera install`. On startup it blocks in `wait_for_initial_association` until `iw dev "$WIFI_IFACE" link` first reports "Connected" — bounded by `INITIAL_ASSOCIATION_TIMEOUT` (default 120s) so a chip that's stuck from boot still triggers a reboot. After that, two checks run once per second: (1) `iw dev "$WIFI_IFACE" link` — any loss of association reboots **immediately** (chip stuck, e.g. overheating); (2) ping the live default gateway on `$WIFI_IFACE` (resolved each check via `ip route show default` — only `$GATEWAY` is used as a final fallback if no default route is present) — only after `PING_FAILURES_BEFORE_REBOOT` consecutive failures (default 30s) is this a reboot trigger, as a slow safety net. The ping target is rediscovered every iteration so the watchdog works on both the original static point-to-point network and any DHCP network the Pi roams onto (the install-baked `$GATEWAY` is fine for the static case but would otherwise force a reboot loop on DHCP). The four runtime knobs (`WIFI_IFACE`, `GATEWAY`, `PING_FAILURES_BEFORE_REBOOT`, `INITIAL_ASSOCIATION_TIMEOUT`) are baked into the generated systemd unit as `Environment=` lines; the installer fills them from its own options. Defaults assume a fixed point-to-point network on `wlan0` (gateway `10.42.0.1`, camera `10.42.0.3`).
+
+**Control categories** ([controls.py](meltingplot/rpi_camera/controls.py)).
+`CURATED_CONTROLS` entries fall into four buckets, split by `_bucket` and
+handled differently by `apply`: live libcamera controls (the default — passed
+to `set_controls`, persisted); `RECONFIG_CONTROLS` (Resolution/FrameRate/
+Rotation — persisted, handed to the reconfig listeners, never `set_controls`);
+`SYSTEM_CONTROLS` (the WiFi-watchdog toggles — drive a systemd unit, **not**
+persisted because the unit's own state is the source of truth, read back live
+by `_overlay_system_state`); and `SERVER_CONTROLS` (`CorsOrigin` — configures
+the HTTP server, **is** persisted since nothing else remembers it, and reaches
+the running handlers through `register_server_listener`). A `SERVER_CONTROLS`
+entry must carry no `default` key, or the defaults loops in `reset` and
+`load_and_apply_persisted` would hand it to `set_controls`. `reset` deliberately
+keeps `SERVER_CONTROLS` — resetting the image settings must not cut off the site
+embedding the camera. `VALIDATORS` normalises a value in `_filter_supported`
+before it is applied or persisted, so a rejected origin becomes a 400 rather
+than a silently broken embed; `load_and_apply_persisted` catches that
+`ValueError` so a hand-edited controls.json cannot take the service down.
 
 **Install side effects** ([cli/install.py](meltingplot/rpi_camera/cli/install.py)). `rpi-camera install` rewrites `rpi-camera.service` to use the current user/group/home, symlinks `<venv>/bin/rpi-camera` into `/usr/local/bin`, then enables and starts the service. Both this installer and the WiFi watchdog's `install_service` probe `/run/systemd/system` to detect whether systemd is actually running — if not (image-build chroot), they skip `daemon-reload`/`start` and create the `multi-user.target.wants/` enable symlink manually, so the service comes up on first real boot. Two independent toggles gate the network side: `--configure-network` / `RPI_CAMERA_CONFIGURE_NETWORK=1` (default **off**) opts in to the nmcli static IP setup, and `--wifi-watchdog/--no-wifi-watchdog` / `RPI_CAMERA_WIFI_WATCHDOG` (default **on**) controls the reboot-on-wifi-disconnect watchdog install — the watchdog is camera-specific safety and is installed even when the rest of the network config lives in the Pi image. The values used by both are taken from `--connection`, `--ip`, `--gateway`, `--dns`, `--iface` (each with a matching `RPI_CAMERA_*` envvar). Both installers (Python and bash watchdog) auto-detect their effective UID — when running as root they drop the `sudo` prefix entirely, so image-build chroots that don't have an interactive sudo password configured work without changes. If you run the install as a non-root user in a chroot, that user still needs passwordless sudo (or the install will fail with `sudo: a password is required`).
 

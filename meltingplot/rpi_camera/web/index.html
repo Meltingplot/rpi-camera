@@ -94,6 +94,7 @@
   }
   .control .pair { display: flex; gap: 8px; }
   .control .pair input { flex: 1; }
+  .hint { color: var(--muted); font-size: 12px; line-height: 1.4; margin: 6px 0 0 0; }
   .toggle-row { display: flex; align-items: center; gap: 10px; }
   .toggle-row .control-label { flex: 1; }
   .switch {
@@ -323,6 +324,7 @@
 
   function renderText(name, meta) {
     const val = valueOrDefault(name, meta);
+    const hint = meta.hint ? `<p class="hint">${meta.hint}</p>` : '';
     return `
       <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
         <div class="control-row">
@@ -330,6 +332,7 @@
         </div>
         <input type="text" data-name="${name}" data-kind="text"
                value="${val}" placeholder="${meta.placeholder || ''}">
+        ${hint}
       </div>`;
   }
 

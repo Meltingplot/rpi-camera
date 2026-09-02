@@ -25,6 +25,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from urllib.parse import urlparse
 
 from libcamera import controls as libcontrols
 
@@ -204,6 +205,24 @@ CURATED_CONTROLS = {
         'group': 'system',
         'placeholder': 'auto-detect',
     },
+    # Not a libcamera control — the HTTP server's cross-origin allow-list, so
+    # another website may draw this stream into a <canvas>. See SERVER_CONTROLS.
+    # Deliberately has no 'default': the defaults loops in reset() and
+    # load_and_apply_persisted() would otherwise hand it to set_controls.
+    'CorsOrigin': {
+        'ui_type':
+        'text',
+        'label':
+        'Embed on other websites (CORS)',
+        'group':
+        'system',
+        'placeholder':
+        'off',
+        'hint':
+        'Websites allowed to read this stream, comma-separated '
+        '(e.g. https://ops.example.com), or * for any. Only needed to draw the '
+        'stream into a <canvas> — an <iframe> or <img> works without it.',
+    },
 }
 
 # Controls that change the capture pipeline (and therefore the USB UVC
@@ -219,6 +238,13 @@ RECONFIG_CONTROLS = frozenset({'Resolution', 'FrameRate', 'Rotation'})
 # controls.json — the systemd unit's own enabled-state is the single source of
 # truth (read back live). Applying one runs systemctl via sudo.
 SYSTEM_CONTROLS = frozenset({'RebootOnWifiLoss', 'WifiWatchdogPingTarget'})
+
+# Controls that configure the HTTP server itself rather than libcamera or the
+# capture pipeline. Unlike SYSTEM_CONTROLS they *are* persisted to
+# controls.json — there is no systemd unit to read them back from — but they
+# are never passed to set_controls; the registered server listener pushes them
+# onto the live request handlers instead.
+SERVER_CONTROLS = frozenset({'CorsOrigin'})
 
 # The WiFi safety watchdog unit is provided by the Pi image (pi-cam-gen
 # stage2/02-net-tweaks), shipped disabled; we only toggle it here.
@@ -307,6 +333,44 @@ def _set_wifi_watchdog_ping_target(value):
         raise RuntimeError('%s failed: %s' % (_WIFI_WATCHDOG_CONFIG, result.stderr.strip()))
 
 
+def _normalise_cors_origin(value):
+    """Validate and canonicalise the CORS allow-list typed into the web UI.
+
+    Accepts '' (off), '*' (any website), or a comma-separated list of
+    ``scheme://host[:port]`` origins. Returns the canonical comma-separated
+    string that is persisted and handed to the HTTP handlers; raises
+    ValueError on anything else, which the control API turns into a 400.
+
+    Validating here rather than in the handlers keeps a typo from silently
+    disabling embedding: the admin gets told, instead of the browser.
+    """
+    text = (value or '').strip()
+    if not text:
+        return ''
+    origins = []
+    for item in text.split(','):
+        item = item.strip().rstrip('/')
+        if not item:
+            continue
+        if item == '*':
+            origins.append(item)
+            continue
+        parsed = urlparse(item)
+        if parsed.scheme not in ('http', 'https') or not parsed.netloc or parsed.path:
+            raise ValueError(
+                'origin must be * or scheme://host[:port], '
+                'e.g. https://ops.example.com (got {!r})'.format(item),
+            )
+        origins.append('{}://{}'.format(parsed.scheme.lower(), parsed.netloc.lower()))
+    return ','.join(origins)
+
+
+# Per-control input normalisers, run before a value is applied or persisted.
+# A ValueError raised here is reported to the UI as a 400 with its message.
+VALIDATORS = {
+    'CorsOrigin': _normalise_cors_origin,
+}
+
 # Map each enum-valued control to the libcamera enum class that owns its
 # values. Used to translate persisted/JSON string names ("Continuous") to
 # the C++ enum value picamera2's set_controls expects.
@@ -384,13 +448,14 @@ class CameraController:
         self._lock = threading.RLock()
         self._state = {}
         self._listeners = []
+        self._server_listeners = []
 
         os.makedirs(os.path.dirname(self._persist_path), exist_ok=True)
 
         available = set(picam2.camera_controls.keys())
         # FrameRate/Resolution are virtual (capture-pipeline) controls that
         # camera_controls doesn't list, so accept them unconditionally.
-        self._supported = (set(CURATED_CONTROLS.keys()) & available) | RECONFIG_CONTROLS
+        self._supported = (set(CURATED_CONTROLS.keys()) & available) | RECONFIG_CONTROLS | SERVER_CONTROLS
         # System toggles only when their backing service is actually present
         # (the image ships the WiFi watchdog unit; dev hosts won't have it).
         if _wifi_watchdog_present():
@@ -405,6 +470,27 @@ class CameraController:
         must return quickly; do the heavy work asynchronously.
         """
         self._listeners.append(fn)
+
+    def register_server_listener(self, fn):
+        """Register ``fn(name, value)`` for :data:`SERVER_CONTROLS` changes.
+
+        Called (outside the lock) whenever a server-level setting such as the
+        CORS allow-list is applied, so the running HTTP handlers pick it up
+        without a restart.
+        """
+        self._server_listeners.append(fn)
+
+    def seed_server_state(self, **values):
+        """Record the server-level settings the CLI supplied, without applying.
+
+        Called once at startup so the web UI shows the allow-list that is
+        actually in force. ``setdefault`` means a persisted user change, loaded
+        immediately afterwards, still wins over the CLI/env value.
+        """
+        with self._lock:
+            for name, value in values.items():
+                if value is not None:
+                    self._state.setdefault(name, value)
 
     def capabilities(self):
         """Return curated metadata enriched with per-sensor bounds.
@@ -431,17 +517,24 @@ class CameraController:
             out[name] = meta
         return out
 
-    def get_state(self):
-        """Return a JSON-safe snapshot of currently applied UI values."""
-        with self._lock:
-            state = dict(self._state)
-        # System toggles aren't persisted in _state — read their live state
-        # from systemd / the config file so the UI always reflects reality.
+    def _overlay_system_state(self, state):
+        """Overlay the live SYSTEM control values onto ``state`` and return it.
+
+        System toggles aren't persisted in ``_state`` — systemd and the image's
+        config file are their source of truth — so every snapshot we hand out
+        reads them back fresh instead of echoing what was last written.
+        """
         if 'RebootOnWifiLoss' in self._supported:
             state['RebootOnWifiLoss'] = _wifi_watchdog_enabled()
         if 'WifiWatchdogPingTarget' in self._supported:
             state['WifiWatchdogPingTarget'] = _wifi_watchdog_ping_target()
         return state
+
+    def get_state(self):
+        """Return a JSON-safe snapshot of currently applied UI values."""
+        with self._lock:
+            state = dict(self._state)
+        return self._overlay_system_state(state)
 
     def bounds(self, name):
         """Return the sensor's ``(min, max, default)`` for a control, or None.
@@ -490,32 +583,42 @@ class CameraController:
                 log.exception('Failed to re-apply live controls after reconfigure')
 
     def _filter_supported(self, partial):
-        """Drop unsupported keys (logged); return only controls we can apply."""
+        """Drop unsupported keys (logged) and normalise the rest.
+
+        Returns only controls we can apply, with any :data:`VALIDATORS` entry
+        already applied — so a rejected value never reaches the camera or the
+        persisted file.
+        """
         out = {}
         for name, value in partial.items():
             if name in self._supported:
-                out[name] = value
+                validator = VALIDATORS.get(name)
+                out[name] = validator(value) if validator is not None else value
             else:
                 log.info('Ignoring unsupported control %s', name)
         return out
 
     @staticmethod
     def _bucket(filtered):
-        """Split into (system, reconfig, live) controls.
+        """Split into (system, server, reconfig, live) controls.
 
         SYSTEM controls drive a systemd unit (not libcamera, not persisted);
-        RECONFIG controls (Resolution/FrameRate/Rotation) are persisted and
-        handed to the reconfig listeners; the rest are live libcamera controls.
+        SERVER controls configure the HTTP server (persisted, pushed to the
+        handlers); RECONFIG controls (Resolution/FrameRate/Rotation) are
+        persisted and handed to the reconfig listeners; the rest are live
+        libcamera controls.
         """
-        system, reconfig, live = {}, {}, {}
+        system, server_side, reconfig, live = {}, {}, {}, {}
         for k, v in filtered.items():
             if k in SYSTEM_CONTROLS:
                 system[k] = v
+            elif k in SERVER_CONTROLS:
+                server_side[k] = v
             elif k in RECONFIG_CONTROLS:
                 reconfig[k] = v
             else:
                 live[k] = v
-        return system, reconfig, live
+        return system, server_side, reconfig, live
 
     @staticmethod
     def _apply_system(system):
@@ -525,6 +628,15 @@ class CameraController:
                 _set_wifi_watchdog(bool(value))
             elif name == 'WifiWatchdogPingTarget':
                 _set_wifi_watchdog_ping_target(value)
+
+    def _apply_server(self, server_side):
+        """Push each SERVER control onto the live handlers (outside the lock)."""
+        for name, value in server_side.items():
+            for fn in self._server_listeners:
+                try:
+                    fn(name, value)
+                except Exception:
+                    log.exception('Server listener failed for %s', name)
 
     def apply(self, partial):
         """Apply a partial control dict to the live camera and persist it.
@@ -540,7 +652,7 @@ class CameraController:
         if not filtered:
             return self.get_state()
 
-        system, reconfig, live = self._bucket(filtered)
+        system, server_side, reconfig, live = self._bucket(filtered)
         self._apply_system(system)
 
         with self._lock:
@@ -550,11 +662,12 @@ class CameraController:
             # System toggles are not persisted — systemd is their source of truth.
             self._state.update({k: v for k, v in filtered.items() if k not in SYSTEM_CONTROLS})
             self._save_locked()
-            merged = dict(self._state)
-        if 'RebootOnWifiLoss' in self._supported:
-            merged['RebootOnWifiLoss'] = _wifi_watchdog_enabled()
-        if 'WifiWatchdogPingTarget' in self._supported:
-            merged['WifiWatchdogPingTarget'] = _wifi_watchdog_ping_target()
+            merged = self._overlay_system_state(dict(self._state))
+
+        # Push server-level settings onto the handlers once they are persisted,
+        # so a restart and the running process agree on the allow-list.
+        if server_side:
+            self._apply_server(server_side)
 
         # Fire reconfig listeners outside the lock: reconfiguring the camera
         # and re-binding the USB gadget can take seconds (the host sees a USB
@@ -575,15 +688,16 @@ class CameraController:
         (set in :data:`CURATED_CONTROLS` — e.g. ``Sharpness: 4.5``) and fall
         back to the libcamera sensor default from ``camera_controls``.
         ``self._state`` and the persisted JSON file are then cleared so a
-        subsequent restart also starts blank. Controls that have neither a
-        curated nor a sensor default (e.g. the virtual ``FrameRate``) are
-        skipped — their current value stands.
+        subsequent restart also starts blank — except for
+        :data:`SERVER_CONTROLS`, which are not camera settings and are kept.
+        Controls that have neither a curated nor a sensor default (e.g. the
+        virtual ``FrameRate``) are skipped — their current value stands.
         """
         info = self._picam2.camera_controls
         defaults = {}
         for name in self._supported:
-            if name in SYSTEM_CONTROLS:
-                continue  # not a libcamera control; leave the systemd unit as-is
+            if name in SYSTEM_CONTROLS or name in SERVER_CONTROLS:
+                continue  # not libcamera controls; leave the unit / server as-is
             curated = CURATED_CONTROLS.get(name, {}).get('default')
             if curated is not None:
                 defaults[name] = _to_libcamera(name, curated)
@@ -595,7 +709,9 @@ class CameraController:
         with self._lock:
             if defaults:
                 self._picam2.set_controls(defaults)
-            self._state = {}
+            # Server-level settings survive: "reset the image settings" must not
+            # silently cut off the website that embeds this camera.
+            self._state = {k: v for k, v in self._state.items() if k in SERVER_CONTROLS}
             self._save_locked()
             return dict(self._state)
 
@@ -672,7 +788,12 @@ class CameraController:
             return
 
         log.info('Loaded %d persisted controls from %s', len(persisted), self._persist_path)
-        self.apply(persisted)
+        try:
+            self.apply(persisted)
+        except ValueError as exc:
+            # A hand-edited file must not take the service down; the curated
+            # defaults above are already in place.
+            log.warning('Persisted controls rejected (%s); keeping defaults', exc)
 
     def _save_locked(self):
         """Write ``self._state`` to disk atomically. Caller holds the lock."""

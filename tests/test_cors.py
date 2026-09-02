@@ -187,6 +187,21 @@ def test_preflight_refused_when_cors_is_off(http_server):
     assert excinfo.value.headers.get('Access-Control-Allow-Origin') is None
 
 
+def test_ui_change_reaches_both_handlers_without_a_restart():
+    """The admin UI's CorsOrigin lands on the live handlers via the server listener."""
+    saved = (srv.HttpHandler.cors_origins, srv.StreamingHandler.cors_origins)
+    try:
+        srv._server_control_listener('CorsOrigin', 'https://Ops.Example.com/')
+        assert srv.HttpHandler.cors_origins == ('https://ops.example.com', )
+        assert srv.StreamingHandler.cors_origins == ('https://ops.example.com', )
+        # Clearing the box in the UI turns embedding back off, also live.
+        srv._server_control_listener('CorsOrigin', '')
+        assert srv.HttpHandler.cors_origins == ()
+        assert srv.StreamingHandler.cors_origins == ()
+    finally:
+        srv.HttpHandler.cors_origins, srv.StreamingHandler.cors_origins = saved
+
+
 def test_stream_port_handler_shares_the_configuration():
     """The dedicated stream port gets the same headers, and is GET-only."""
     assert issubclass(srv.StreamingHandler, srv._CorsMixin)

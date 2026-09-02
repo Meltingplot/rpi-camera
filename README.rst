@@ -66,13 +66,17 @@ nor a ``frame-ancestors`` policy:
     <img src="http://<ip_address>/webcam">
 
 Drawing the stream into a ``<canvas>`` is different: without CORS the canvas
-becomes *tainted* and ``getImageData()`` / ``toDataURL()`` throw. Start the
-server with the embedding site's origin allowed:
+becomes *tainted* and ``getImageData()`` / ``toDataURL()`` throw. Allow the
+embedding site's origin under **System > Embed on other websites (CORS)** in
+the camera's web UI — the change takes effect immediately and survives a
+restart. The same setting is available on the command line:
 
 .. code-block:: bash
 
     rpi-camera start --cors-origin https://ops.example.com   # or '*' for any site
     rpi-camera install --cors-origin https://ops.example.com # bake it into the service
+
+A value saved in the web UI wins over the command-line one.
 
 and load the stream with ``crossorigin`` on the embedding page:
 
