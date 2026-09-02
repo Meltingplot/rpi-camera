@@ -219,9 +219,8 @@ CURATED_CONTROLS = {
         'placeholder':
         'off',
         'hint':
-        'Websites allowed to read this stream, comma-separated '
-        '(e.g. https://ops.example.com), or * for any. Only needed to draw the '
-        'stream into a <canvas> — an <iframe> or <img> works without it.',
+        'Sites allowed to read this stream (e.g. https://ops.example.com), '
+        'or * for any. Only needed for canvas embedding.',
     },
 }
 

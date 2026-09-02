@@ -209,6 +209,15 @@
   let capabilities = {};
   let toastTimer = null;
 
+  // Control metadata is interpolated into innerHTML, so anything that looks
+  // like a tag has to be escaped -- a hint mentioning <canvas> would otherwise
+  // open a real element and swallow the rest of the text.
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
   function showToast(msg, kind) {
     toast.textContent = msg;
     toast.className = 'show ' + (kind || '');
@@ -270,7 +279,7 @@
     return `
       <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
         <div class="control-row">
-          <span class="control-label">${meta.label}</span>
+          <span class="control-label">${esc(meta.label)}</span>
           <span class="control-value" data-value-of="${name}">${displayVal}</span>
         </div>
         <input type="range" data-name="${name}" data-kind="slider"
@@ -283,7 +292,7 @@
     return `
       <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
         <div class="toggle-row">
-          <span class="control-label">${meta.label}</span>
+          <span class="control-label">${esc(meta.label)}</span>
           <div class="switch ${val ? 'on' : ''}" data-name="${name}" data-kind="toggle"></div>
         </div>
       </div>`;
@@ -295,7 +304,7 @@
     return `
       <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
         <div class="control-row">
-          <span class="control-label">${meta.label}</span>
+          <span class="control-label">${esc(meta.label)}</span>
         </div>
         <select data-name="${name}" data-kind="select">${opts}</select>
       </div>`;
@@ -311,7 +320,7 @@
     return `
       <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
         <div class="control-row">
-          <span class="control-label">${meta.label}</span>
+          <span class="control-label">${esc(meta.label)}</span>
         </div>
         <div class="pair">
           <input type="number" data-name="${name}" data-kind="pair" data-index="0"
@@ -324,14 +333,14 @@
 
   function renderText(name, meta) {
     const val = valueOrDefault(name, meta);
-    const hint = meta.hint ? `<p class="hint">${meta.hint}</p>` : '';
+    const hint = meta.hint ? `<p class="hint">${esc(meta.hint)}</p>` : '';
     return `
       <div class="control ${isDisabled(meta) ? 'disabled' : ''}">
         <div class="control-row">
-          <span class="control-label">${meta.label}</span>
+          <span class="control-label">${esc(meta.label)}</span>
         </div>
         <input type="text" data-name="${name}" data-kind="text"
-               value="${val}" placeholder="${meta.placeholder || ''}">
+               value="${esc(val)}" placeholder="${esc(meta.placeholder || '')}">
         ${hint}
       </div>`;
   }
